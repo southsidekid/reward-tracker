@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).with_name("reward_bot.sqlite3")
+DB_PATH = Path(os.getenv("DB_PATH", str(Path(__file__).with_name("reward_bot.sqlite3"))))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (

@@ -7,6 +7,7 @@ from datetime import date
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -56,6 +57,14 @@ def allowed(uid: int) -> bool:
     return not cfg.allowed_user_ids or uid in cfg.allowed_user_ids
 
 
+async def safe_answer(call: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
+    """Отвечаем на callback сразу, игнорируя 'query is too old'."""
+    try:
+        await call.answer(text, show_alert=show_alert)
+    except TelegramBadRequest:
+        pass
+
+
 async def show_text(call: CallbackQuery, text: str, markup=None) -> None:
     try:
         await call.message.delete()
@@ -80,7 +89,7 @@ async def ensure_user(message: Message | CallbackQuery):
     u = message.from_user
     if not allowed(u.id):
         if isinstance(message, CallbackQuery):
-            await message.answer("Доступ закрыт.", show_alert=True)
+            await safe_answer(message, "Доступ закрыт.", show_alert=True)
         else:
             await message.answer("Доступ закрыт для этого аккаунта.")
         return False
@@ -103,20 +112,21 @@ async def start(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "menu:add")
 async def menu_add(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await state.clear()
     await show_text(call, "➕ <b>Добавить встречу</b>\n\nВыбери тип встречи:", meeting_categories())
-    await call.answer()
 
 
 @dp.callback_query(F.data.startswith("meetcat:"))
 async def choose_meeting_category(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     category = call.data.split(":", 1)[1]
     if category not in MEETING_PRODUCTS:
-        await call.answer("Ошибка", show_alert=True)
+        await safe_answer(call, "Ошибка", show_alert=True)
         return
     await state.update_data(category=category)
     if category == "install":
@@ -130,17 +140,17 @@ async def choose_meeting_category(call: CallbackQuery, state: FSMContext):
     else:
         title = "🇷🇺 <b>РФ</b>" if category == "rf" else "🌍 <b>Нерезидент</b>"
         await call.message.edit_text(title + "\n\nВыбери основной продукт встречи:", reply_markup=meeting_products(category))
-    await call.answer()
 
 
 @dp.callback_query(F.data.startswith("mprod:"))
 async def choose_main_product(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     _, category, product_code = call.data.split(":", 2)
     product = next((x for x in MEETING_PRODUCTS[category] if x[0] == product_code), None)
     if product is None:
-        await call.answer("Ошибка", show_alert=True)
+        await safe_answer(call, "Ошибка", show_alert=True)
         return
     _, report_type, base = product
     await state.update_data(category=category, product_code=product_code, report_type=report_type, base_reward=base)
@@ -150,7 +160,6 @@ async def choose_main_product(call: CallbackQuery, state: FSMContext):
         f"База за встречу: <b>{base} ₽</b>\n\n"
         "🆔 Введи ID встречи одним сообщением."
     )
-    await call.answer()
 
 
 @dp.message(AddMeeting.waiting_id)
@@ -189,24 +198,24 @@ async def enter_meeting_id(message: Message, state: FSMContext):
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("ogroup:"))
 async def choose_offer_group(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     idx = int(call.data.split(":")[1])
     if idx < 0 or idx >= len(OFFER_GROUPS):
-        await call.answer("Ошибка группы", show_alert=True)
+        await safe_answer(call, "Ошибка группы", show_alert=True)
         return
     group = OFFER_GROUPS[idx]
     await state.update_data(current_group_index=idx)
     await call.message.edit_text(f"📦 <b>{group}</b>\n\nВыбери офер:", reply_markup=offers_keyboard(idx, OFFERS_BY_GROUP[group]))
-    await call.answer()
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data == "offers:backgroups")
 async def back_offer_groups(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await call.message.edit_text("📦 <b>Дополнительные оферы</b>\n\nВыбери группу:", reply_markup=offer_groups())
-    await call.answer()
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("offer:"))
@@ -216,19 +225,20 @@ async def add_selected_offer(call: CallbackQuery, state: FSMContext):
     _, idx_s, opt_s = call.data.split(":")
     idx, opt = int(idx_s), int(opt_s)
     if idx < 0 or idx >= len(OFFER_GROUPS):
-        await call.answer("Ошибка", show_alert=True)
+        await safe_answer(call, "Ошибка", show_alert=True)
         return
     group = OFFER_GROUPS[idx]
     options = OFFERS_BY_GROUP.get(group, ())
     if opt < 0 or opt >= len(options):
-        await call.answer("Ошибка", show_alert=True)
+        await safe_answer(call, "Ошибка", show_alert=True)
         return
     offer = options[opt]
     data = await state.get_data()
     mid = int(data["meeting_id"])
     if offer_exists(mid, offer.code):
-        await call.answer("Этот офер уже добавлен в эту встречу", show_alert=True)
+        await safe_answer(call, "Этот офер уже добавлен в эту встречу", show_alert=True)
         return
+    await safe_answer(call)
     add_offer(
         mid,
         offer.code,
@@ -247,25 +257,24 @@ async def add_selected_offer(call: CallbackQuery, state: FSMContext):
         f"Оферов: <b>{count}</b> · Добавить ещё?",
         reply_markup=offer_groups(),
     )
-    await call.answer()
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("oquick:"))
 async def add_quick_offer(call: CallbackQuery, state: FSMContext):
-    """Смарт и Доп. тревел — фиксированные оферы, добавляются одним нажатием,
-    без подменю и без ручного ввода суммы."""
+    """Смарт и Доп. тревел — фиксированные оферы, добавляются одним нажатием."""
     if not await ensure_user(call):
         return
     code = call.data.split(":", 1)[1]
     offer = QUICK_OFFERS_BY_CODE.get(code)
     if offer is None:
-        await call.answer("Ошибка", show_alert=True)
+        await safe_answer(call, "Ошибка", show_alert=True)
         return
     data = await state.get_data()
     mid = int(data["meeting_id"])
     if offer_exists(mid, offer.code):
-        await call.answer("Этот офер уже добавлен в эту встречу", show_alert=True)
+        await safe_answer(call, "Этот офер уже добавлен в эту встречу", show_alert=True)
         return
+    await safe_answer(call)
     add_offer(
         mid,
         offer.code,
@@ -282,7 +291,6 @@ async def add_quick_offer(call: CallbackQuery, state: FSMContext):
         f"Оферов: <b>{count}</b> · Добавить ещё?",
         reply_markup=offer_groups(),
     )
-    await call.answer()
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data == "offers:undo")
@@ -292,8 +300,9 @@ async def undo_offer(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     deleted = delete_last_offer(int(data["meeting_id"]), call.from_user.id)
     if deleted is None:
-        await call.answer("Удалять нечего", show_alert=True)
+        await safe_answer(call, "Удалять нечего", show_alert=True)
         return
+    await safe_answer(call)
     count = max(0, int(data.get("offer_count", 0)) - 1)
     await state.update_data(offer_count=count)
     deleted_name = deleted.get("name", "Офер")
@@ -302,39 +311,39 @@ async def undo_offer(call: CallbackQuery, state: FSMContext):
         f"↩️ Удалён: <b>{deleted_name}</b> · {deleted_reward} ₽\n\nВыбери следующий:",
         reply_markup=offer_groups(),
     )
-    await call.answer()
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data == "offers:done")
 async def finish_meeting(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await state.clear()
     await show_text(call, "✅ <b>Встреча зафиксирована.</b>\n\n" + today_text(call.from_user.id), main_menu())
-    await call.answer()
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data == "meeting:cancel")
 async def cancel_meeting(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await state.clear()
     deleted = delete_last_meeting(call.from_user.id)
     text = "🗑 Черновик встречи удалён." if deleted else "Действие отменено."
     await show_text(call, text, main_menu())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "menu:today")
 async def menu_today(call: CallbackQuery):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await show_text(call, today_text(call.from_user.id), main_menu())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "menu:month")
 async def menu_month(call: CallbackQuery):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     today = date.today()
@@ -343,7 +352,6 @@ async def menu_month(call: CallbackQuery):
         "📈 <b>Отчёт за месяц</b>\n\nВыбери месяц:",
         month_selector_keyboard(today.year, today.month),
     )
-    await call.answer()
 
 
 @dp.callback_query(F.data.startswith("month:"))
@@ -356,8 +364,10 @@ async def select_month(call: CallbackQuery):
         if month < 1 or month > 12 or year < 2000 or year > 2100:
             raise ValueError
     except (ValueError, IndexError):
-        await call.answer("Некорректный месяц", show_alert=True)
+        await safe_answer(call, "Некорректный месяц", show_alert=True)
         return
+
+    await safe_answer(call)
 
     try:
         chart = await month_chart_quickchart(call.from_user.id, year, month)
@@ -369,7 +379,6 @@ async def select_month(call: CallbackQuery):
             "\n\n⚠️ Не удалось построить график (QuickChart недоступен).",
             month_selector_keyboard(year, month),
         )
-        await call.answer()
         return
 
     await show_photo(
@@ -383,31 +392,30 @@ async def select_month(call: CallbackQuery):
         month_details_text(call.from_user.id, year, month),
         reply_markup=month_selector_keyboard(year, month),
     )
-    await call.answer()
 
 
 @dp.callback_query(F.data == "menu:report")
 async def menu_report(call: CallbackQuery):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await show_text(call, daily_report(call.from_user.id), main_menu())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "menu:history")
 async def menu_history(call: CallbackQuery):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await show_text(call, history_text(call.from_user.id), main_menu())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "menu:undo")
 async def menu_undo(call: CallbackQuery):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await show_text(call, "⚠️ Удалить последнюю добавленную встречу?\nУдаление необратимо.", confirm_delete())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "undo:yes")
@@ -415,6 +423,7 @@ async def undo_yes(call: CallbackQuery):
     if not await ensure_user(call):
         return
     deleted = delete_last_meeting(call.from_user.id)
+    await safe_answer(call)
     if deleted:
         deleted_offers = deleted.get("offers", [])
         details = "\n".join(
@@ -430,24 +439,23 @@ async def undo_yes(call: CallbackQuery):
     else:
         text = "Нечего удалять."
     await show_text(call, text, main_menu())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "undo:no")
 async def undo_no(call: CallbackQuery):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await show_text(call, "Удаление отменено.", main_menu())
-    await call.answer()
 
 
 @dp.callback_query(F.data == "cancel")
 async def cancel(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
     if not await ensure_user(call):
         return
     await state.clear()
     await show_text(call, "Действие отменено.", main_menu())
-    await call.answer()
 
 
 async def main():
