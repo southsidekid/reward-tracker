@@ -11,6 +11,9 @@ from catalog import OFFER_GROUP_ABBR, OFFERS_BY_CODE
 from db import (
     get_meeting_offers,
     month_meetings,
+    offers_deferred_arriving_in_month,
+    offers_deferred_sold_in_month,
+    offers_non_deferred_for_month,
     recent_meetings,
     today_meetings,
 )
@@ -35,7 +38,6 @@ def rub(n: int) -> str:
 
 
 def _is_deferred_offer(offer_row) -> bool:
-    """Смарт/страховка — единственные оферы с payout_date."""
     return bool(offer_row["payout_date"])
 
 
@@ -69,11 +71,11 @@ def _meeting_row_label(name: str, condition: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Отчёт «Сегодня» — короткая сводка.
+# Отчёт «Сегодня»
 # ---------------------------------------------------------------------------
 
 def today_stats(telegram_id: int) -> dict:
-    d = today_local()  # <-- учитывает BOT_TIMEZONE, а не серверный TZ
+    d = today_local()
     meetings = today_meetings(telegram_id, d.isoformat())
     per_meeting = []
     total_with = 0
@@ -152,33 +154,37 @@ def history_text(telegram_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Отчёт «Месяц» — всё считается по месяцу ПРОДАЖИ (дате встречи).
-#   • «Итого со Смарт/страховкой» = база + все оферы (включая Смарт/страховки).
-#   • «Итого чистыми»             = база + обычные оферы (без Смарт/страховок).
-# Смарт/страховки этого месяца отдельно показаны в блоке «Отложено».
+# Отчёт «Месяц»
+#
+#   Итого чистыми            = база + обычные оферы этого месяца
+#                              (то, что рисуется на графике)
+#   Итого со Смарт/страховкой = чистыми + Смарт/страховки этого месяца
+#                              + Смарт/страховки, прилетевшие из прошлого месяца
 # ---------------------------------------------------------------------------
 
 def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
     days = monthrange(year, month)[1]
     meetings = month_meetings(telegram_id, year, month)
+    non_deferred = offers_non_deferred_for_month(telegram_id, year, month)
+    deferred_arriving = offers_deferred_arriving_in_month(telegram_id, year, month)
+    deferred_sold = offers_deferred_sold_in_month(telegram_id, year, month)
 
-    base_sum = 0
-    all_offers = []
+    # График — «чистыми» по дням
     values = [0] * days
     for m in meetings:
         day = int(str(m["meeting_date"])[-2:])
-        base = int(m["base_reward"])
-        base_sum += base
-        values[day - 1] += base
-        for o in get_meeting_offers(int(m["id"])):
-            all_offers.append(o)
-            values[day - 1] += int(o["reward"])
+        values[day - 1] += int(m["base_reward"])
+    for o in non_deferred:
+        day = int(str(o["meeting_date"])[-2:])
+        values[day - 1] += int(o["reward"])
 
-    deferred_sold = sum(int(o["reward"]) for o in all_offers if _is_deferred_offer(o))
-    non_deferred_sold = sum(int(o["reward"]) for o in all_offers if not _is_deferred_offer(o))
+    base_sum = sum(int(m["base_reward"]) for m in meetings)
+    non_deferred_sum = sum(int(o["reward"]) for o in non_deferred)
+    arriving_sum = sum(int(o["reward"]) for o in deferred_arriving)
+    sold_sum = sum(int(o["reward"]) for o in deferred_sold)
 
-    total_with = base_sum + non_deferred_sold + deferred_sold
-    total_without = base_sum + non_deferred_sold
+    total_without = base_sum + non_deferred_sum
+    total_with = total_without + arriving_sum + sold_sum
 
     main_rows = _group_rows(
         [(str(m["report_type"]), str(m["report_type"]), int(m["base_reward"])) for m in meetings]
@@ -190,19 +196,27 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
                 _meeting_row_key(str(o["name"]), str(o["condition"])),
                 int(o["reward"]),
             )
-            for o in all_offers
-            if not _is_deferred_offer(o)
+            for o in non_deferred
         ]
     )
-    deferred_rows = _group_rows(
+    sold_rows = _group_rows(
         [
             (
                 _meeting_row_label(str(o["name"]), str(o["condition"])),
                 _meeting_row_key(str(o["name"]), str(o["condition"])),
                 int(o["reward"]),
             )
-            for o in all_offers
-            if _is_deferred_offer(o)
+            for o in deferred_sold
+        ]
+    )
+    arriving_rows = _group_rows(
+        [
+            (
+                _meeting_row_label(str(o["name"]), str(o["condition"])),
+                _meeting_row_key(str(o["name"]), str(o["condition"])),
+                int(o["reward"]),
+            )
+            for o in deferred_arriving
         ]
     )
     return {
@@ -214,9 +228,13 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
         "total_without": total_without,
         "meetings": len(meetings),
         "main_rows": main_rows,
+        "main_total": base_sum,
         "extra_rows": extra_rows,
-        "deferred_total": deferred_sold,
-        "deferred_rows": deferred_rows,
+        "extra_total": non_deferred_sum,
+        "deferred_total": sold_sum,
+        "deferred_rows": sold_rows,
+        "deferred_arriving_total": arriving_sum,
+        "deferred_arriving_rows": arriving_rows,
     }
 
 
@@ -231,6 +249,10 @@ def month_summary_text(telegram_id: int, year: int | None = None, month: int | N
         f"Итого со Смарт/страховкой: <b>{rub(data['total_with'])}</b>",
         f"Итого чистыми: <b>{rub(data['total_without'])}</b>",
     ]
+    if data["deferred_arriving_total"]:
+        lines.append(
+            f"➕ Прилетело из прошлого месяца: <b>{rub(data['deferred_arriving_total'])}</b>"
+        )
     if data["deferred_total"]:
         lines.append(
             f"⏳ Продано в этом месяце, попадёт в стату 1-го числа след. месяца: "
@@ -239,8 +261,8 @@ def month_summary_text(telegram_id: int, year: int | None = None, month: int | N
     return "\n".join(lines)
 
 
-def _rows_to_text(title: str, rows: list[tuple[str, int, int]]) -> str:
-    lines = [f"<b>{title}</b>"]
+def _rows_to_text(title: str, total: int, rows: list[tuple[str, int, int]]) -> str:
+    lines = [f"<b>{title} — {rub(total)}</b>"]
     if not rows:
         lines.append("Нет данных")
         return "\n".join(lines)
@@ -255,15 +277,25 @@ def month_details_text(telegram_id: int, year: int | None = None, month: int | N
     month = today.month if month is None else month
     data = month_dashboard_data(telegram_id, year, month)
     parts = [
-        _rows_to_text("Основные продукты за месяц", data["main_rows"]),
+        _rows_to_text("Основные продукты за месяц", data["main_total"], data["main_rows"]),
         "",
-        _rows_to_text("Доп. продукты и услуги за месяц", data["extra_rows"]),
+        _rows_to_text("Доп. продукты и услуги за месяц", data["extra_total"], data["extra_rows"]),
     ]
+    if data["deferred_arriving_rows"]:
+        parts.append("")
+        parts.append(
+            _rows_to_text(
+                f"Прилетело из прошлого месяца · {rub(data['deferred_arriving_total'])}",
+                data["deferred_arriving_total"],
+                data["deferred_arriving_rows"],
+            )
+        )
     if data["deferred_rows"]:
         parts.append("")
         parts.append(
             _rows_to_text(
                 f"Отложено на 1-е следующего месяца · {rub(data['deferred_total'])}",
+                data["deferred_total"],
                 data["deferred_rows"],
             )
         )
@@ -278,7 +310,7 @@ def _quickchart_config(data: dict, title: str) -> dict:
             "labels": labels,
             "datasets": [
                 {
-                    "label": "Доход, ₽",
+                    "label": "Итого чистыми, ₽",
                     "data": data["values"],
                     "backgroundColor": RED,
                     "borderRadius": 4,
@@ -290,10 +322,7 @@ def _quickchart_config(data: dict, title: str) -> dict:
             "legend": {"display": False},
             "scales": {
                 "xAxes": [
-                    {
-                        "gridLines": {"color": "#2A2A2A"},
-                        "ticks": {"fontColor": MUTED},
-                    }
+                    {"gridLines": {"color": "#2A2A2A"}, "ticks": {"fontColor": MUTED}}
                 ],
                 "yAxes": [
                     {
@@ -316,7 +345,8 @@ async def month_chart_quickchart(
     year = today.year if year is None else year
     month = today.month if month is None else month
     data = month_dashboard_data(telegram_id, year, month)
-    title = f"{RU_MONTHS[month - 1]} {year}"
+    # Заголовок: месяц год · сумма по графику (чистыми)
+    title = f"{RU_MONTHS[month - 1]} {year} · {rub(data['total_without'])}"
     config = _quickchart_config(data, title)
     payload = {
         "chart": config,
