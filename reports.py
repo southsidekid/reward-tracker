@@ -10,12 +10,11 @@ import aiohttp
 from catalog import OFFER_GROUP_ABBR, OFFERS_BY_CODE
 from db import (
     get_meeting_offers,
-    month_deferred_pending,
     month_meetings,
-    month_stat_offers,
-    today_meetings,
     recent_meetings,
+    today_meetings,
 )
+from time_utils import today_local
 
 RU_MONTHS = (
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -36,15 +35,11 @@ def rub(n: int) -> str:
 
 
 def _is_deferred_offer(offer_row) -> bool:
-    """Смарт/страховка — единственные оферы с payout_date, то есть с переносом
-    на 1-е число следующего месяца."""
+    """Смарт/страховка — единственные оферы с payout_date."""
     return bool(offer_row["payout_date"])
 
 
 def _offer_group_label(code: str, name: str) -> str:
-    """Короткий ярлык группы офера для отчёта за сегодня. Если офер больше
-    не числится в каталоге (например, снят с продажи), безопасно
-    откатываемся к первому слову его сохранённого названия."""
     catalog_offer = OFFERS_BY_CODE.get(code)
     if catalog_offer is not None:
         return OFFER_GROUP_ABBR.get(catalog_offer.group, catalog_offer.group.lower())
@@ -52,9 +47,6 @@ def _offer_group_label(code: str, name: str) -> str:
 
 
 def _group_rows(items: list[tuple[str, str, int]]) -> list[tuple[str, int, int]]:
-    """items: (label, group_key, reward). Группирует по group_key (а не только
-    по имени), чтобы разные тарифы одного продукта не схлопывались в одну
-    строку. Возвращает (label, кол-во, сумма) в порядке первого появления."""
     qty: dict[str, int] = defaultdict(int)
     money: dict[str, int] = defaultdict(int)
     label_for: dict[str, str] = {}
@@ -81,8 +73,8 @@ def _meeting_row_label(name: str, condition: str) -> str:
 # ---------------------------------------------------------------------------
 
 def today_stats(telegram_id: int) -> dict:
-    d = date.today().isoformat()
-    meetings = today_meetings(telegram_id, d)
+    d = today_local()  # <-- учитывает BOT_TIMEZONE, а не серверный TZ
+    meetings = today_meetings(telegram_id, d.isoformat())
     per_meeting = []
     total_with = 0
     total_without = 0
@@ -104,7 +96,7 @@ def today_stats(telegram_id: int) -> dict:
             "total": total_reward,
         })
     return {
-        "date": date.today(),
+        "date": d,
         "meetings": meetings,
         "per_meeting": per_meeting,
         "total_with": total_with,
@@ -117,24 +109,19 @@ def today_text(telegram_id: int) -> str:
     lines = [
         f"📊 <b>Сегодня, {s['date']:%d.%m.%Y}</b>",
         f"Встреч: <b>{len(s['meetings'])}</b>",
-        f"Итого (со Смарт/страховкой): <b>{rub(s['total_with'])}</b>",
+        f"Итого со Смарт/страховкой: <b>{rub(s['total_with'])}</b>",
     ]
     if s["total_with"] != s["total_without"]:
-        lines.append(f"Без Смарт/страховки: <b>{rub(s['total_without'])}</b>")
+        lines.append(f"Итого чистыми: <b>{rub(s['total_without'])}</b>")
     return "\n".join(lines)
 
 
 def daily_report(telegram_id: int) -> str:
-    """Отчёт за сегодня в формате:
-    Число
-    Встреч · Итого
-    n. Id, тип встречи, вкратце оферы — сумма
-    """
     s = today_stats(telegram_id)
     lines = [f"🧾 <b>{s['date']:%d.%m.%Y}</b>"]
     total_line = f"Встреч: <b>{len(s['meetings'])}</b> · Итого: <b>{rub(s['total_with'])}</b>"
     if s["total_with"] != s["total_without"]:
-        total_line += f" (без Смарт/страховки: {rub(s['total_without'])})"
+        total_line += f" (чистыми: {rub(s['total_without'])})"
     lines.append(total_line)
 
     if not s["meetings"]:
@@ -165,30 +152,33 @@ def history_text(telegram_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Отчёт «Месяц» — график через QuickChart + текстовая сводка.
+# Отчёт «Месяц» — всё считается по месяцу ПРОДАЖИ (дате встречи).
+#   • «Итого со Смарт/страховкой» = база + все оферы (включая Смарт/страховки).
+#   • «Итого чистыми»             = база + обычные оферы (без Смарт/страховок).
+# Смарт/страховки этого месяца отдельно показаны в блоке «Отложено».
 # ---------------------------------------------------------------------------
 
 def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
     days = monthrange(year, month)[1]
     meetings = month_meetings(telegram_id, year, month)
-    stat_offers = month_stat_offers(telegram_id, year, month)
-    pending = month_deferred_pending(telegram_id, year, month)
 
+    base_sum = 0
+    all_offers = []
     values = [0] * days
     for m in meetings:
         day = int(str(m["meeting_date"])[-2:])
-        values[day - 1] += int(m["base_reward"])
-    for o in stat_offers:
-        payout = str(o["payout_date"] or "")
-        if payout.startswith(f"{year:04d}-{month:02d}-"):
-            day = int(payout[-2:])
-        else:
-            day = int(str(o["meeting_date"])[-2:])
-        values[day - 1] += int(o["reward"])
+        base = int(m["base_reward"])
+        base_sum += base
+        values[day - 1] += base
+        for o in get_meeting_offers(int(m["id"])):
+            all_offers.append(o)
+            values[day - 1] += int(o["reward"])
 
-    deferred_in_stat = sum(int(o["reward"]) for o in stat_offers if _is_deferred_offer(o))
-    total_with = sum(values)
-    total_without = total_with - deferred_in_stat
+    deferred_sold = sum(int(o["reward"]) for o in all_offers if _is_deferred_offer(o))
+    non_deferred_sold = sum(int(o["reward"]) for o in all_offers if not _is_deferred_offer(o))
+
+    total_with = base_sum + non_deferred_sold + deferred_sold
+    total_without = base_sum + non_deferred_sold
 
     main_rows = _group_rows(
         [(str(m["report_type"]), str(m["report_type"]), int(m["base_reward"])) for m in meetings]
@@ -200,7 +190,8 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
                 _meeting_row_key(str(o["name"]), str(o["condition"])),
                 int(o["reward"]),
             )
-            for o in stat_offers
+            for o in all_offers
+            if not _is_deferred_offer(o)
         ]
     )
     deferred_rows = _group_rows(
@@ -210,7 +201,8 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
                 _meeting_row_key(str(o["name"]), str(o["condition"])),
                 int(o["reward"]),
             )
-            for o in pending
+            for o in all_offers
+            if _is_deferred_offer(o)
         ]
     )
     return {
@@ -223,7 +215,7 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
         "meetings": len(meetings),
         "main_rows": main_rows,
         "extra_rows": extra_rows,
-        "deferred_total": sum(int(o["reward"]) for o in pending),
+        "deferred_total": deferred_sold,
         "deferred_rows": deferred_rows,
     }
 
@@ -236,12 +228,14 @@ def month_summary_text(telegram_id: int, year: int | None = None, month: int | N
     lines = [
         f"📈 <b>{RU_MONTHS[month - 1]} {year}</b>",
         f"Встреч: <b>{data['meetings']}</b>",
-        f"Итого (со Смарт/страховкой): <b>{rub(data['total_with'])}</b>",
+        f"Итого со Смарт/страховкой: <b>{rub(data['total_with'])}</b>",
+        f"Итого чистыми: <b>{rub(data['total_without'])}</b>",
     ]
-    if data["total_with"] != data["total_without"]:
-        lines.append(f"Без Смарт/страховки: <b>{rub(data['total_without'])}</b>")
     if data["deferred_total"]:
-        lines.append(f"⏳ Продано в этом месяце, попадёт в стату 1-го числа след. месяца: <b>{rub(data['deferred_total'])}</b>")
+        lines.append(
+            f"⏳ Продано в этом месяце, попадёт в стату 1-го числа след. месяца: "
+            f"<b>{rub(data['deferred_total'])}</b>"
+        )
     return "\n".join(lines)
 
 
@@ -312,10 +306,12 @@ def _quickchart_config(data: dict, title: str) -> dict:
     }
 
 
-async def month_chart_quickchart(telegram_id: int, year: int | None = None, month: int | None = None, timeout_seconds: float = 15.0) -> BytesIO:
-    """Строит PNG-график за месяц через публичный API QuickChart
-    (https://quickchart.io/chart), без локальной отрисовки и без
-    зависимости от шрифтов/matplotlib на машине, где запущен бот."""
+async def month_chart_quickchart(
+    telegram_id: int,
+    year: int | None = None,
+    month: int | None = None,
+    timeout_seconds: float = 15.0,
+) -> BytesIO:
     today = date.today()
     year = today.year if year is None else year
     month = today.month if month is None else month
