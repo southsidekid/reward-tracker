@@ -111,21 +111,18 @@ def today_text(telegram_id: int) -> str:
     lines = [
         f"📊 <b>Сегодня, {s['date']:%d.%m.%Y}</b>",
         f"Встреч: <b>{len(s['meetings'])}</b>",
-        f"Итого со Смарт/страховкой: <b>{rub(s['total_with'])}</b>",
+        f"Чистыми: <b>{rub(s['total_without'])}</b> · Со Смарт/страх: <b>{rub(s['total_with'])}</b>",
     ]
-    if s["total_with"] != s["total_without"]:
-        lines.append(f"Итого чистыми: <b>{rub(s['total_without'])}</b>")
     return "\n".join(lines)
 
 
 def daily_report(telegram_id: int) -> str:
     s = today_stats(telegram_id)
-    lines = [f"🧾 <b>{s['date']:%d.%m.%Y}</b>"]
-    total_line = f"Встреч: <b>{len(s['meetings'])}</b> · Итого: <b>{rub(s['total_with'])}</b>"
-    if s["total_with"] != s["total_without"]:
-        total_line += f" (чистыми: {rub(s['total_without'])})"
-    lines.append(total_line)
-
+    lines = [
+        f"🧾 <b>{s['date']:%d.%m.%Y}</b>",
+        f"Встреч: <b>{len(s['meetings'])}</b> · Чистыми: <b>{rub(s['total_without'])}</b> · "
+        f"Со Смарт/страх: <b>{rub(s['total_with'])}</b>",
+    ]
     if not s["meetings"]:
         lines.append("\nПусто.")
         return "\n".join(lines)
@@ -155,11 +152,6 @@ def history_text(telegram_id: int) -> str:
 
 # ---------------------------------------------------------------------------
 # Отчёт «Месяц»
-#
-#   Итого чистыми            = база + обычные оферы этого месяца
-#                              (то, что рисуется на графике)
-#   Итого со Смарт/страховкой = чистыми + Смарт/страховки этого месяца
-#                              + Смарт/страховки, прилетевшие из прошлого месяца
 # ---------------------------------------------------------------------------
 
 def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
@@ -169,7 +161,6 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
     deferred_arriving = offers_deferred_arriving_in_month(telegram_id, year, month)
     deferred_sold = offers_deferred_sold_in_month(telegram_id, year, month)
 
-    # График — «чистыми» по дням
     values = [0] * days
     for m in meetings:
         day = int(str(m["meeting_date"])[-2:])
@@ -238,6 +229,11 @@ def month_dashboard_data(telegram_id: int, year: int, month: int) -> dict:
     }
 
 
+def _prev_month_label(year: int, month: int) -> str:
+    y, m = (year - 1, 12) if month == 1 else (year, month - 1)
+    return f"{RU_MONTHS[m - 1].lower()}"
+
+
 def month_summary_text(telegram_id: int, year: int | None = None, month: int | None = None) -> str:
     today = date.today()
     year = today.year if year is None else year
@@ -246,28 +242,26 @@ def month_summary_text(telegram_id: int, year: int | None = None, month: int | N
     lines = [
         f"📈 <b>{RU_MONTHS[month - 1]} {year}</b>",
         f"Встреч: <b>{data['meetings']}</b>",
-        f"Итого со Смарт/страховкой: <b>{rub(data['total_with'])}</b>",
-        f"Итого чистыми: <b>{rub(data['total_without'])}</b>",
+        f"Чистыми: <b>{rub(data['total_without'])}</b> · Со Смарт/страх: <b>{rub(data['total_with'])}</b>",
     ]
     if data["deferred_arriving_total"]:
         lines.append(
-            f"➕ Прилетело из прошлого месяца: <b>{rub(data['deferred_arriving_total'])}</b>"
+            f"➕ Перенесено с прошлого месяца: <b>{rub(data['deferred_arriving_total'])}</b>"
         )
     if data["deferred_total"]:
         lines.append(
-            f"⏳ Продано в этом месяце, попадёт в стату 1-го числа след. месяца: "
-            f"<b>{rub(data['deferred_total'])}</b>"
+            f"⏳ Уйдёт на 1-е след. месяца: <b>{rub(data['deferred_total'])}</b>"
         )
     return "\n".join(lines)
 
 
-def _rows_to_text(title: str, total: int, rows: list[tuple[str, int, int]]) -> str:
-    lines = [f"<b>{title} — {rub(total)}</b>"]
+def _rows_to_text(title: str, rows: list[tuple[str, int, int]]) -> str:
+    lines = [f"<b>{title}</b>"]
     if not rows:
-        lines.append("Нет данных")
+        lines.append("— нет")
         return "\n".join(lines)
     for name, qty, money in rows:
-        lines.append(f"• {name} — {qty} шт. · {rub(money)}")
+        lines.append(f"• {name} — {qty} шт · {rub(money)}")
     return "\n".join(lines)
 
 
@@ -277,16 +271,15 @@ def month_details_text(telegram_id: int, year: int | None = None, month: int | N
     month = today.month if month is None else month
     data = month_dashboard_data(telegram_id, year, month)
     parts = [
-        _rows_to_text("Основные продукты за месяц", data["main_total"], data["main_rows"]),
+        _rows_to_text(f"Основные — {rub(data['main_total'])}", data["main_rows"]),
         "",
-        _rows_to_text("Доп. продукты и услуги за месяц", data["extra_total"], data["extra_rows"]),
+        _rows_to_text(f"Доп — {rub(data['extra_total'])}", data["extra_rows"]),
     ]
     if data["deferred_arriving_rows"]:
         parts.append("")
         parts.append(
             _rows_to_text(
-                f"Прилетело из прошлого месяца · {rub(data['deferred_arriving_total'])}",
-                data["deferred_arriving_total"],
+                f"➕ Перенесено с {_prev_month_label(year, month)} — {rub(data['deferred_arriving_total'])}",
                 data["deferred_arriving_rows"],
             )
         )
@@ -294,8 +287,7 @@ def month_details_text(telegram_id: int, year: int | None = None, month: int | N
         parts.append("")
         parts.append(
             _rows_to_text(
-                f"Отложено на 1-е следующего месяца · {rub(data['deferred_total'])}",
-                data["deferred_total"],
+                f"⏳ Отложено на 1-е след. месяца — {rub(data['deferred_total'])}",
                 data["deferred_rows"],
             )
         )
@@ -310,7 +302,7 @@ def _quickchart_config(data: dict, title: str) -> dict:
             "labels": labels,
             "datasets": [
                 {
-                    "label": "Итого чистыми, ₽",
+                    "label": "Чистыми, ₽",
                     "data": data["values"],
                     "backgroundColor": RED,
                     "borderRadius": 4,
@@ -345,7 +337,6 @@ async def month_chart_quickchart(
     year = today.year if year is None else year
     month = today.month if month is None else month
     data = month_dashboard_data(telegram_id, year, month)
-    # Заголовок: месяц год · сумма по графику (чистыми)
     title = f"{RU_MONTHS[month - 1]} {year} · {rub(data['total_without'])}"
     config = _quickchart_config(data, title)
     payload = {

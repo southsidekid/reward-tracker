@@ -381,18 +381,19 @@ async def select_month(call: CallbackQuery):
         )
         return
 
+    # 1) Фото с короткой подписью, БЕЗ кнопок
     await show_photo(
         call,
         chart,
         month_summary_text(call.from_user.id, year, month),
-        month_selector_keyboard(year, month),
     )
     chart.close()
+
+    # 2) Одно компактное сообщение с деталями и кнопками
     await call.message.answer(
         month_details_text(call.from_user.id, year, month),
         reply_markup=month_selector_keyboard(year, month),
     )
-
 
 @dp.callback_query(F.data == "menu:report")
 async def menu_report(call: CallbackQuery):
