@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date
 
 from aiogram import Bot, Dispatcher, F
@@ -12,25 +13,39 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from catalog import MEETING_PRODUCTS, OFFER_GROUPS, OFFERS_BY_GROUP, QUICK_OFFERS, payout_date_for
+from catalog import (
+    MEETING_PRODUCTS,
+    OFFER_ALIASES,
+    OFFER_GROUPS,
+    OFFERS_BY_CODE,
+    OFFERS_BY_GROUP,
+    QUICK_OFFERS,
+    next_month_first,
+    payout_date_for,
+)
 from config import load_config
 from db import (
     add_offer,
     create_meeting,
     delete_last_meeting,
     delete_last_offer,
+    get_last_meeting_with_offers,
     init_db,
     offer_exists,
     upsert_user,
 )
 from keyboards import (
+    cancel_to_menu,
     confirm_delete,
     main_menu,
     meeting_categories,
     meeting_products,
+    month_selector_keyboard,
     offer_groups,
     offers_keyboard,
-    month_selector_keyboard,
+    report_result_menu,
+    reports_menu,
+    settings_menu,
 )
 from reports import (
     daily_report,
@@ -52,9 +67,10 @@ dp = Dispatcher()
 
 QUICK_OFFERS_BY_CODE = {o.code: o for o in QUICK_OFFERS}
 
-# Список "активных" сообщений бота в каждом чате. Перед отправкой нового
-# ответа их удаляем, чтобы не копить флуд в истории.
+# Трекер активных сообщений бота в каждом чате (для чистки флуда)
 _last_bot_msgs: dict[int, list[int]] = {}
+
+HELLO = "💰 <b>Reward Tracker</b> — учёт вознаграждения по встречам и оферам."
 
 
 def allowed(uid: int) -> bool:
@@ -62,11 +78,10 @@ def allowed(uid: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Хелперы для управления "последним сообщением"
+# Хелперы управления сообщениями
 # ---------------------------------------------------------------------------
 
 async def _forget_and_delete(chat_id: int, *, skip: int | None = None) -> None:
-    """Удаляем все трекнутые сообщения бота в чате (кроме skip)."""
     ids = _last_bot_msgs.pop(chat_id, [])
     for mid in ids:
         if skip is not None and mid == skip:
@@ -86,7 +101,6 @@ def _track_extra(chat_id: int, message_id: int) -> None:
 
 
 async def safe_answer(call: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
-    """Отвечаем на callback сразу, игнорируя 'query is too old'."""
     try:
         await call.answer(text, show_alert=show_alert)
     except TelegramBadRequest:
@@ -94,7 +108,6 @@ async def safe_answer(call: CallbackQuery, text: str | None = None, show_alert: 
 
 
 async def show_text(call: CallbackQuery, text: str, markup=None) -> None:
-    """Удаляем старые сообщения бота + сообщение с кнопкой → шлём новое."""
     chat_id = call.message.chat.id
     await _forget_and_delete(chat_id, skip=call.message.message_id)
     try:
@@ -121,7 +134,6 @@ async def show_photo(call: CallbackQuery, image, caption: str, markup=None) -> N
 
 
 async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
-    """Редактируем сообщение на месте, сохраняя его как «текущее»."""
     chat_id = call.message.chat.id
     await _forget_and_delete(chat_id, skip=call.message.message_id)
     try:
@@ -131,13 +143,11 @@ async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
         if "message is not modified" in str(e):
             _track(chat_id, call.message.message_id)
             return
-        # Фоллбэк: отправляем новым сообщением (редкий случай)
         msg = await bot.send_message(chat_id, text, reply_markup=markup)
         _track(chat_id, msg.message_id)
 
 
 async def _reply_and_track(message: Message, text: str, markup=None) -> Message:
-    """Ответ на текстовое сообщение пользователя: чистим старое, шлём новое."""
     chat_id = message.chat.id
     try:
         await message.delete()
@@ -162,7 +172,7 @@ async def ensure_user(message: Message | CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Хендлеры
+# Старт и навигация
 # ---------------------------------------------------------------------------
 
 @dp.message(CommandStart())
@@ -170,14 +180,176 @@ async def start(message: Message, state: FSMContext):
     if not await ensure_user(message):
         return
     await state.clear()
-    await _reply_and_track(
-        message,
-        "🅰️ <b>Reward Tracker</b> — version 3.0.4." \
-        "\n\nДобавляй встречи, фиксируй оферы и смотри статистику по дням и месяцам." \
-        " \n\nВыбери действие:",
-        main_menu(),
+    await _reply_and_track(message, HELLO, main_menu())
+
+
+@dp.callback_query(F.data == "nav:main")
+async def nav_main(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    current_state = await state.get_state()
+    await state.clear()
+    text = HELLO
+    if current_state == AddMeeting.waiting_offers.state:
+        text = "✅ Встреча сохранена с текущими оферами.\n\n" + HELLO
+    await show_text(call, text, main_menu())
+
+
+@dp.callback_query(F.data == "menu:reports")
+async def menu_reports(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await state.clear()
+    await show_text(call, "📊 <b>Отчёты</b>\n\nВыбери раздел:", reports_menu())
+
+
+@dp.callback_query(F.data == "menu:settings")
+async def menu_settings(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await state.clear()
+    await show_text(call, "⚙️ <b>Настройки</b>", settings_menu())
+
+
+# ---------------------------------------------------------------------------
+# Отчёты
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "report:today")
+async def report_today(call: CallbackQuery):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await show_text(call, today_text(call.from_user.id), report_result_menu())
+
+
+@dp.callback_query(F.data == "report:daily")
+async def report_daily(call: CallbackQuery):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await show_text(call, daily_report(call.from_user.id), report_result_menu())
+
+
+@dp.callback_query(F.data == "report:history")
+async def report_history(call: CallbackQuery):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await show_text(call, history_text(call.from_user.id), report_result_menu())
+
+
+@dp.callback_query(F.data == "report:month")
+async def report_month(call: CallbackQuery):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    today = date.today()
+    await show_text(
+        call,
+        "📈 <b>Отчёт за месяц</b>\n\nВыбери месяц:",
+        month_selector_keyboard(today.year, today.month),
     )
 
+
+@dp.callback_query(F.data.startswith("month:"))
+async def select_month(call: CallbackQuery):
+    if not await ensure_user(call):
+        return
+    try:
+        year_s, month_s = call.data.split(":", 1)[1].split("-", 1)
+        year, month = int(year_s), int(month_s)
+        if month < 1 or month > 12 or year < 2000 or year > 2100:
+            raise ValueError
+    except (ValueError, IndexError):
+        await safe_answer(call, "Некорректный месяц", show_alert=True)
+        return
+
+    await safe_answer(call)
+    chat_id = call.message.chat.id
+
+    try:
+        chart = await month_chart_quickchart(call.from_user.id, year, month)
+    except Exception:
+        log.exception("QuickChart request failed for %04d-%02d", year, month)
+        await show_text(
+            call,
+            month_summary_text(call.from_user.id, year, month) +
+            "\n\n⚠️ Не удалось построить график (QuickChart недоступен).",
+            month_selector_keyboard(year, month),
+        )
+        return
+
+    await _forget_and_delete(chat_id, skip=call.message.message_id)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    photo_msg = await bot.send_photo(
+        chat_id,
+        BufferedInputFile(chart.getvalue(), filename=chart.name),
+        caption=month_summary_text(call.from_user.id, year, month),
+    )
+    chart.close()
+
+    details_msg = await bot.send_message(
+        chat_id,
+        month_details_text(call.from_user.id, year, month),
+        reply_markup=month_selector_keyboard(year, month),
+    )
+    _track(chat_id, photo_msg.message_id, details_msg.message_id)
+
+
+# ---------------------------------------------------------------------------
+# Удаление последней встречи
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "settings:undo")
+async def settings_undo(call: CallbackQuery):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await show_text(call, "⚠️ Удалить последнюю добавленную встречу?\nУдаление необратимо.", confirm_delete())
+
+
+@dp.callback_query(F.data == "undo:yes")
+async def undo_yes(call: CallbackQuery):
+    if not await ensure_user(call):
+        return
+    deleted = delete_last_meeting(call.from_user.id)
+    await safe_answer(call)
+    if deleted:
+        deleted_offers = deleted.get("offers", [])
+        details = "\n".join(
+            f"• {o['name']} · {int(o['reward'])} ₽" for o in deleted_offers
+        ) or "• Доп. оферов не было"
+        text = (
+            f"🗑 Удалена встреча <code>{deleted['meeting_code']}</code>\n"
+            f"Тип: <b>{deleted['report_type']}</b>\n"
+            f"База: {int(deleted['base_reward'])} ₽\n"
+            f"Удалено оферов: {len(deleted_offers)}\n{details}\n\n"
+            + today_text(call.from_user.id)
+        )
+    else:
+        text = "Нечего удалять."
+    await show_text(call, text, settings_menu())
+
+
+@dp.callback_query(F.data == "undo:no")
+async def undo_no(call: CallbackQuery):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await show_text(call, "⚙️ <b>Настройки</b>", settings_menu())
+
+
+# ---------------------------------------------------------------------------
+# Добавление встречи (обычное)
+# ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data == "menu:add")
 async def menu_add(call: CallbackQuery, state: FSMContext):
@@ -204,6 +376,7 @@ async def choose_meeting_category(call: CallbackQuery, state: FSMContext):
         await _edit(
             call,
             "🛠 <b>Установка</b>\n\nБаза: <b>340 ₽</b>\n\nТеперь введи ID встречи.",
+            cancel_to_menu(),
         )
     else:
         title = "🇷🇺 <b>РФ</b>" if category == "rf" else "🌍 <b>Нерезидент</b>"
@@ -232,6 +405,7 @@ async def choose_main_product(call: CallbackQuery, state: FSMContext):
         f"✅ <b>{report_type}</b>\n"
         f"База за встречу: <b>{base} ₽</b>\n\n"
         "🆔 Введи ID встречи одним сообщением.",
+        cancel_to_menu(),
     )
 
 
@@ -246,6 +420,11 @@ async def enter_meeting_id(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
+    if "category" not in data:
+        await _reply_and_track(message, "Сессия истекла, начни заново.", main_menu())
+        await state.clear()
+        return
+
     mid = create_meeting(
         message.from_user.id,
         meeting_code,
@@ -270,10 +449,109 @@ async def enter_meeting_id(message: Message, state: FSMContext):
             f"✅ Встреча сохранена: <code>{meeting_code}</code>\n"
             f"Тип: <b>{data['report_type']}</b>\n"
             f"База: <b>{data['base_reward']} ₽</b>\n\n"
-            "Теперь добавляй дополнительные оферы. Можно добавить несколько.",
+            "Теперь добавляй оферы кнопками или напиши списком:\n"
+            "<i>например: смарт, тревел, pp</i>",
             offer_groups(),
         )
 
+
+# ---------------------------------------------------------------------------
+# «Как вчера» — дублирование последней встречи, новый ID вводится вручную
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "menu:dup")
+async def menu_dup(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await state.clear()
+
+    last = get_last_meeting_with_offers(call.from_user.id)
+    if not last:
+        await show_text(call, "🔁 Дублировать нечего — прошлых встреч нет.", main_menu())
+        return
+
+    await state.update_data(
+        dup_category=last["category"],
+        dup_report_type=last["report_type"],
+        dup_base_reward=int(last["base_reward"]),
+        dup_offers=[
+            {
+                "code": o["code"],
+                "name": o["name"],
+                "condition": o["condition"],
+                "reward": int(o["reward"]),
+                "payout_date": o["payout_date"],
+            }
+            for o in last["offers"]
+        ],
+    )
+    await state.set_state(AddMeeting.waiting_dup_id)
+
+    offers_text = "\n".join(f"• {o['name']} · {int(o['reward'])} ₽" for o in last["offers"]) or "• (без доп. оферов)"
+    await show_text(
+        call,
+        f"🔁 <b>Как вчера</b>\n\n"
+        f"Прошлый тип: <b>{last['report_type']}</b>\n"
+        f"База: <b>{int(last['base_reward'])} ₽</b>\n"
+        f"Оферы:\n{offers_text}\n\n"
+        f"🆔 Введи <b>новый</b> ID встречи одним сообщением.",
+        cancel_to_menu(),
+    )
+
+
+@dp.message(AddMeeting.waiting_dup_id)
+async def enter_dup_id(message: Message, state: FSMContext):
+    if not await ensure_user(message):
+        return
+    meeting_code = (message.text or "").strip()
+    if not meeting_code or len(meeting_code) > 100:
+        err = await message.answer("ID должен быть непустым и не длиннее 100 символов.")
+        _track_extra(message.chat.id, err.message_id)
+        return
+
+    data = await state.get_data()
+    if "dup_category" not in data:
+        await _reply_and_track(message, "Сессия истекла, начни заново.", main_menu())
+        await state.clear()
+        return
+
+    today_iso = today_local().isoformat()
+    mid = create_meeting(
+        message.from_user.id,
+        meeting_code,
+        data["dup_category"],
+        data["dup_report_type"],
+        today_iso,
+        int(data["dup_base_reward"]),
+    )
+
+    for old in data.get("dup_offers", []):
+        code = old["code"]
+        cat_offer = OFFERS_BY_CODE.get(code)
+        if cat_offer is not None:
+            payout = payout_date_for(cat_offer, today_iso)
+        elif old.get("payout_date"):
+            # офер не в каталоге, но был отложенным — оставляем логику переноса
+            payout = next_month_first(today_iso)
+        else:
+            payout = None
+        add_offer(mid, code, old["name"], old["condition"], int(old["reward"]), payout)
+
+    await state.clear()
+    await _reply_and_track(
+        message,
+        f"✅ <b>Создано как вчера</b>\n"
+        f"ID: <code>{meeting_code}</code>\n"
+        f"Тип: <b>{data['dup_report_type']}</b>\n\n"
+        + today_text(message.from_user.id),
+        main_menu(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Работа с оферами встречи (кнопками + текстом)
+# ---------------------------------------------------------------------------
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("ogroup:"))
 async def choose_offer_group(call: CallbackQuery, state: FSMContext):
@@ -294,7 +572,7 @@ async def back_offer_groups(call: CallbackQuery, state: FSMContext):
     await safe_answer(call)
     if not await ensure_user(call):
         return
-    await _edit(call, "📦 <b>Дополнительные оферы</b>\n\nВыбери группу:", offer_groups())
+    await _edit(call, "📦 <b>Дополнительные оферы</b>\n\nВыбери группу или напиши список:", offer_groups())
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("offer:"))
@@ -319,11 +597,7 @@ async def add_selected_offer(call: CallbackQuery, state: FSMContext):
         return
     await safe_answer(call)
     add_offer(
-        mid,
-        offer.code,
-        offer.name,
-        offer.condition,
-        offer.reward,
+        mid, offer.code, offer.name, offer.condition, offer.reward,
         payout_date_for(offer, today_local().isoformat()),
     )
     count = int(data.get("offer_count", 0)) + 1
@@ -355,11 +629,7 @@ async def add_quick_offer(call: CallbackQuery, state: FSMContext):
         return
     await safe_answer(call)
     add_offer(
-        mid,
-        offer.code,
-        offer.name,
-        offer.condition,
-        offer.reward,
+        mid, offer.code, offer.name, offer.condition, offer.reward,
         payout_date_for(offer, today_local().isoformat()),
     )
     count = int(data.get("offer_count", 0)) + 1
@@ -414,133 +684,80 @@ async def cancel_meeting(call: CallbackQuery, state: FSMContext):
     await show_text(call, text, main_menu())
 
 
-@dp.callback_query(F.data == "menu:today")
-async def menu_today(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
+# ---------------------------------------------------------------------------
+# Быстрый ввод оферов текстом: «смарт, тревел, pp»
+# ---------------------------------------------------------------------------
+
+@dp.message(AddMeeting.waiting_offers)
+async def parse_offers_text(message: Message, state: FSMContext):
+    if not await ensure_user(message):
         return
-    await show_text(call, today_text(call.from_user.id), main_menu())
-
-
-@dp.callback_query(F.data == "menu:month")
-async def menu_month(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    today = date.today()
-    await show_text(
-        call,
-        "📈 <b>Отчёт за месяц</b>\n\nВыбери месяц:",
-        month_selector_keyboard(today.year, today.month),
-    )
-
-
-@dp.callback_query(F.data.startswith("month:"))
-async def select_month(call: CallbackQuery):
-    if not await ensure_user(call):
-        return
-    try:
-        year_s, month_s = call.data.split(":", 1)[1].split("-", 1)
-        year, month = int(year_s), int(month_s)
-        if month < 1 or month > 12 or year < 2000 or year > 2100:
-            raise ValueError
-    except (ValueError, IndexError):
-        await safe_answer(call, "Некорректный месяц", show_alert=True)
+    raw = (message.text or "").strip()
+    if not raw:
         return
 
-    await safe_answer(call)
-    chat_id = call.message.chat.id
+    data = await state.get_data()
+    mid = data.get("meeting_id")
+    if not mid:
+        await _reply_and_track(message, "Сессия истекла, начни заново.", main_menu())
+        await state.clear()
+        return
 
-    try:
-        chart = await month_chart_quickchart(call.from_user.id, year, month)
-    except Exception:
-        log.exception("QuickChart request failed for %04d-%02d", year, month)
-        await show_text(
-            call,
-            month_summary_text(call.from_user.id, year, month) +
-            "\n\n⚠️ Не удалось построить график (QuickChart недоступен).",
-            month_selector_keyboard(year, month),
+    tokens = [t.strip().lower() for t in re.split(r"[,\n;]+", raw) if t.strip()]
+
+    added: list[str] = []
+    skipped: list[str] = []
+    unknown: list[str] = []
+
+    for tok in tokens:
+        code = OFFER_ALIASES.get(tok)
+        if not code:
+            unknown.append(tok)
+            continue
+        offer = OFFERS_BY_CODE.get(code)
+        if offer is None:
+            unknown.append(tok)
+            continue
+        if offer_exists(int(mid), offer.code):
+            skipped.append(offer.name)
+            continue
+        add_offer(
+            int(mid), offer.code, offer.name, offer.condition, offer.reward,
+            payout_date_for(offer, today_local().isoformat()),
         )
-        return
+        added.append(f"{offer.name} · +{offer.reward} ₽")
 
-    # Чистим всё старое (включая текущее сообщение с кнопкой)
-    await _forget_and_delete(chat_id, skip=call.message.message_id)
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
+    count = int(data.get("offer_count", 0)) + len(added)
+    await state.update_data(offer_count=count)
 
-    # 1) Фото с короткой подписью, без кнопок
-    photo_msg = await bot.send_photo(
-        chat_id,
-        BufferedInputFile(chart.getvalue(), filename=chart.name),
-        caption=month_summary_text(call.from_user.id, year, month),
-    )
-    chart.close()
+    lines = ["⚡ <b>Быстрый ввод</b>"]
+    if added:
+        lines.append("")
+        lines.append("✅ Добавлено:")
+        lines.extend(f"• {x}" for x in added)
+    if skipped:
+        lines.append("")
+        lines.append("⚠️ Уже были:")
+        lines.extend(f"• {x}" for x in skipped)
+    if unknown:
+        lines.append("")
+        lines.append("❓ Не распознал:")
+        lines.extend(f"• {x}" for x in unknown)
+        lines.append("")
+        lines.append("<i>Сложные тарифы (КС, БС разных сумм) — через кнопки.</i>")
+    if not added and not skipped and not unknown:
+        lines.append("")
+        lines.append("Ничего не понял, попробуй ещё раз.")
 
-    # 2) Одно компактное сообщение с деталями и кнопками
-    details_msg = await bot.send_message(
-        chat_id,
-        month_details_text(call.from_user.id, year, month),
-        reply_markup=month_selector_keyboard(year, month),
-    )
-    _track(chat_id, photo_msg.message_id, details_msg.message_id)
+    lines.append("")
+    lines.append(f"Всего оферов у встречи: <b>{count}</b>")
 
-
-@dp.callback_query(F.data == "menu:report")
-async def menu_report(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, daily_report(call.from_user.id), main_menu())
+    await _reply_and_track(message, "\n".join(lines), offer_groups())
 
 
-@dp.callback_query(F.data == "menu:history")
-async def menu_history(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, history_text(call.from_user.id), main_menu())
-
-
-@dp.callback_query(F.data == "menu:undo")
-async def menu_undo(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, "⚠️ Удалить последнюю добавленную встречу?\nУдаление необратимо.", confirm_delete())
-
-
-@dp.callback_query(F.data == "undo:yes")
-async def undo_yes(call: CallbackQuery):
-    if not await ensure_user(call):
-        return
-    deleted = delete_last_meeting(call.from_user.id)
-    await safe_answer(call)
-    if deleted:
-        deleted_offers = deleted.get("offers", [])
-        details = "\n".join(
-            f"• {o['name']} · {int(o['reward'])} ₽" for o in deleted_offers
-        ) or "• Доп. оферов не было"
-        text = (
-            f"🗑 Удалена встреча <code>{deleted['meeting_code']}</code>\n"
-            f"Тип: <b>{deleted['report_type']}</b>\n"
-            f"База: {int(deleted['base_reward'])} ₽\n"
-            f"Удалено оферов: {len(deleted_offers)}\n{details}\n\n"
-            + today_text(call.from_user.id)
-        )
-    else:
-        text = "Нечего удалять."
-    await show_text(call, text, main_menu())
-
-
-@dp.callback_query(F.data == "undo:no")
-async def undo_no(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, "Удаление отменено.", main_menu())
-
+# ---------------------------------------------------------------------------
+# Отмена (совместимость)
+# ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data == "cancel")
 async def cancel(call: CallbackQuery, state: FSMContext):

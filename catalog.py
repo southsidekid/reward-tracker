@@ -154,3 +154,56 @@ OFFER_GROUP_ABBR = {
     "Доп. симка": "сим",
     "Доп. тревел": "тревел",
 }
+
+# Алиасы для быстрого ввода оферов текстом.
+# Пользователь пишет: "смарт, тревел, pp" → бот добавляет эти оферы.
+OFFER_ALIASES: dict[str, str] = {
+    # Быстрые
+    "смарт": "a_smart",
+    "smart": "a_smart",
+    "тревел": "travel_fixed",
+    "трэвел": "travel_fixed",
+    "travel": "travel_fixed",
+    "детская": "kids_cross",
+    "kids": "kids_cross",
+    "crosskids": "kids_cross",
+
+    # Страховки
+    "защитник": "pp_cc",
+    "pp": "pp_cc",
+    "ppi": "pp_cc",
+    "пипи": "pp_cc",
+    "сс": "pp_cc",
+    "страх": "pp_cc",
+    "страховка": "pp_cc",
+    "кс": "ks_4_10k",
+    "кс10": "ks_4_10k",
+    "кс4": "ks_2_4k",
+    "кс1": "ks_up_to_1k",
+
+    # Инвестиции
+    "бс": "broker_1_20k",
+    "брокер": "broker_50k",
+    "бс50": "broker_50k",
+    "бс20": "broker_20_50k",
+    "инвесткопилка": "invest_pocket",
+    "копилка": "invest_pocket",
+    "изк": "izk_active",
+
+    # Накопительный
+    "нс": "pds",
+    "накоп": "pds",
+    "накопительный": "saving_50k",
+    "миллионер": "millionaire",
+    "пдс": "pds",
+
+    # Комбо
+    "кл": "combo_cc1_cc2",
+    "комбо": "combo_cc1_cc2",
+    "combo": "combo_cc1_cc2",
+
+    # Доп. симка
+    "mvno": "mvno_active",
+    "сим": "mvno_active",
+    "симка": "mvno_active",
+}

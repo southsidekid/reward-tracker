@@ -150,6 +150,23 @@ def delete_last_meeting(telegram_id: int):
         return meeting
 
 
+def get_last_meeting_with_offers(telegram_id: int):
+    """Возвращает последнюю встречу вместе со списком оферов (без удаления)."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT * FROM meetings WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+        if not row:
+            return None
+        meeting = dict(row)
+        offers = [dict(r) for r in c.execute(
+            "SELECT * FROM offers WHERE meeting_id = ? ORDER BY id", (int(row["id"]),)
+        ).fetchall()]
+        meeting["offers"] = offers
+        return meeting
+
+
 def offer_exists(meeting_id: int, code: str) -> bool:
     with conn() as c:
         row = c.execute(
