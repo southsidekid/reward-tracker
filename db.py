@@ -226,8 +226,19 @@ def month_meetings(telegram_id: int, year: int, month: int):
         ).fetchall()
 
 
-def month_stat_offers(telegram_id: int, year: int, month: int):
-    """Оферы, которые входят в месяц: обычные в день продажи или отложенные в день выплаты."""
+def offers_for_meetings(meeting_ids: list[int]):
+    if not meeting_ids:
+        return []
+    placeholders = ",".join("?" * len(meeting_ids))
+    with conn() as c:
+        return c.execute(
+            f"SELECT * FROM offers WHERE meeting_id IN ({placeholders}) ORDER BY id",
+            meeting_ids,
+        ).fetchall()
+
+
+def offers_non_deferred_for_month(telegram_id: int, year: int, month: int):
+    """Обычные оферы (без payout_date) для встреч этого месяца."""
     prefix = f"{year:04d}-{month:02d}-%"
     with conn() as c:
         return c.execute(
@@ -235,18 +246,31 @@ def month_stat_offers(telegram_id: int, year: int, month: int):
                FROM offers o
                JOIN meetings m ON m.id = o.meeting_id
                WHERE m.telegram_id = ?
-                 AND (
-                   (IFNULL(o.payout_date, '') != '' AND o.payout_date LIKE ?)
-                   OR
-                   (IFNULL(o.payout_date, '') = '' AND m.meeting_date LIKE ?)
-                 )
+                 AND m.meeting_date LIKE ?
+                 AND IFNULL(o.payout_date, '') = ''
                ORDER BY o.id""",
-            (telegram_id, prefix, prefix),
+            (telegram_id, prefix),
         ).fetchall()
 
 
-def month_deferred_pending(telegram_id: int, year: int, month: int):
-    """Смарт/страховки, проданные в этом месяце, но ещё не попавшие в месячную стату."""
+def offers_deferred_arriving_in_month(telegram_id: int, year: int, month: int):
+    """Смарт/страховки, у которых payout_date попадает в этот месяц (прилетели)."""
+    prefix = f"{year:04d}-{month:02d}-%"
+    with conn() as c:
+        return c.execute(
+            """SELECT o.*, m.meeting_date
+               FROM offers o
+               JOIN meetings m ON m.id = o.meeting_id
+               WHERE m.telegram_id = ?
+                 AND IFNULL(o.payout_date, '') != ''
+                 AND o.payout_date LIKE ?
+               ORDER BY o.id""",
+            (telegram_id, prefix),
+        ).fetchall()
+
+
+def offers_deferred_sold_in_month(telegram_id: int, year: int, month: int):
+    """Смарт/страховки, проданные в этом месяце (уйдут в след. месяц)."""
     prefix = f"{year:04d}-{month:02d}-%"
     with conn() as c:
         return c.execute(
@@ -256,18 +280,6 @@ def month_deferred_pending(telegram_id: int, year: int, month: int):
                WHERE m.telegram_id = ?
                  AND m.meeting_date LIKE ?
                  AND IFNULL(o.payout_date, '') != ''
-                 AND o.payout_date NOT LIKE ?
                ORDER BY o.id""",
-            (telegram_id, prefix, prefix),
-        ).fetchall()
-
-
-def offers_for_meetings(meeting_ids: list[int]):
-    if not meeting_ids:
-        return []
-    placeholders = ",".join("?" * len(meeting_ids))
-    with conn() as c:
-        return c.execute(
-            f"SELECT * FROM offers WHERE meeting_id IN ({placeholders}) ORDER BY id",
-            meeting_ids,
+            (telegram_id, prefix),
         ).fetchall()
