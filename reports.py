@@ -362,12 +362,12 @@ async def month_chart_quickchart(
     payload = {
         "chart": config,
         "backgroundColor": BG,
-        "width": 900,
-        "height": 420,
-        "devicePixelRatio": 2,
+        "width": 800,
+        "height": 360,
+        "devicePixelRatio": 1,
         "format": "png",
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(QUICKCHART_URL, json=payload) as resp:
             resp.raise_for_status()

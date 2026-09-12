@@ -7,6 +7,7 @@ from datetime import date, datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
@@ -58,7 +59,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 cfg = load_config()
-bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+_bot_session = AiohttpSession(timeout=90)
+bot = Bot(
+    cfg.bot_token,
+    session=_bot_session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
 # Трекер активных сообщений бота в каждом чате (для чистки флуда)
@@ -326,20 +332,37 @@ async def select_month(call: CallbackQuery):
     except Exception:
         pass
 
-    photo_msg = await bot.send_photo(
-        chat_id,
-        BufferedInputFile(chart.getvalue(), filename=chart.name),
-        caption=month_summary_text(call.from_user.id, year, month),
-    )
-    chart.close()
+    # Пробуем отправить фото, если не получилось — отдаём текстом
+    try:
+        photo_msg = await bot.send_photo(
+            chat_id,
+            BufferedInputFile(chart.getvalue(), filename=chart.name),
+            caption=month_summary_text(call.from_user.id, year, month),
+            request_timeout=90,
+        )
+        chart.close()
+        _track(chat_id, photo_msg.message_id)
+    except Exception:
+        log.exception("send_photo failed, falling back to text")
+        chart.close()
+        await bot.send_message(
+            chat_id,
+            month_summary_text(call.from_user.id, year, month) +
+            "\n\n⚠️ Не удалось отправить график.",
+            reply_markup=month_selector_keyboard(year, month),
+        )
+        return
 
-    details_msg = await bot.send_message(
-        chat_id,
-        month_details_text(call.from_user.id, year, month),
-        reply_markup=month_selector_keyboard(year, month),
-    )
-    _track(chat_id, photo_msg.message_id, details_msg.message_id)
-
+    try:
+        details_msg = await bot.send_message(
+            chat_id,
+            month_details_text(call.from_user.id, year, month),
+            reply_markup=month_selector_keyboard(year, month),
+            request_timeout=90,
+        )
+        _track_extra(chat_id, details_msg.message_id)
+    except Exception:
+        log.exception("send_message (details) failed")
 
 # ---------------------------------------------------------------------------
 # Удаление последней встречи
