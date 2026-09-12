@@ -52,9 +52,37 @@ dp = Dispatcher()
 
 QUICK_OFFERS_BY_CODE = {o.code: o for o in QUICK_OFFERS}
 
+# Список "активных" сообщений бота в каждом чате. Перед отправкой нового
+# ответа их удаляем, чтобы не копить флуд в истории.
+_last_bot_msgs: dict[int, list[int]] = {}
+
 
 def allowed(uid: int) -> bool:
     return not cfg.allowed_user_ids or uid in cfg.allowed_user_ids
+
+
+# ---------------------------------------------------------------------------
+# Хелперы для управления "последним сообщением"
+# ---------------------------------------------------------------------------
+
+async def _forget_and_delete(chat_id: int, *, skip: int | None = None) -> None:
+    """Удаляем все трекнутые сообщения бота в чате (кроме skip)."""
+    ids = _last_bot_msgs.pop(chat_id, [])
+    for mid in ids:
+        if skip is not None and mid == skip:
+            continue
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+def _track(chat_id: int, *message_ids: int) -> None:
+    _last_bot_msgs[chat_id] = list(message_ids)
+
+
+def _track_extra(chat_id: int, message_id: int) -> None:
+    _last_bot_msgs.setdefault(chat_id, []).append(message_id)
 
 
 async def safe_answer(call: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
@@ -66,23 +94,59 @@ async def safe_answer(call: CallbackQuery, text: str | None = None, show_alert: 
 
 
 async def show_text(call: CallbackQuery, text: str, markup=None) -> None:
+    """Удаляем старые сообщения бота + сообщение с кнопкой → шлём новое."""
+    chat_id = call.message.chat.id
+    await _forget_and_delete(chat_id, skip=call.message.message_id)
     try:
         await call.message.delete()
     except Exception:
         pass
-    await call.message.answer(text, reply_markup=markup)
+    msg = await call.message.answer(text, reply_markup=markup)
+    _track(chat_id, msg.message_id)
 
 
 async def show_photo(call: CallbackQuery, image, caption: str, markup=None) -> None:
+    chat_id = call.message.chat.id
+    await _forget_and_delete(chat_id, skip=call.message.message_id)
     try:
         await call.message.delete()
     except Exception:
         pass
-    await call.message.answer_photo(
+    msg = await call.message.answer_photo(
         BufferedInputFile(image.getvalue(), filename=image.name),
         caption=caption,
         reply_markup=markup,
     )
+    _track(chat_id, msg.message_id)
+
+
+async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
+    """Редактируем сообщение на месте, сохраняя его как «текущее»."""
+    chat_id = call.message.chat.id
+    await _forget_and_delete(chat_id, skip=call.message.message_id)
+    try:
+        msg = await call.message.edit_text(text, reply_markup=markup)
+        _track(chat_id, msg.message_id)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            _track(chat_id, call.message.message_id)
+            return
+        # Фоллбэк: отправляем новым сообщением (редкий случай)
+        msg = await bot.send_message(chat_id, text, reply_markup=markup)
+        _track(chat_id, msg.message_id)
+
+
+async def _reply_and_track(message: Message, text: str, markup=None) -> Message:
+    """Ответ на текстовое сообщение пользователя: чистим старое, шлём новое."""
+    chat_id = message.chat.id
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await _forget_and_delete(chat_id)
+    msg = await message.answer(text, reply_markup=markup)
+    _track(chat_id, msg.message_id)
+    return msg
 
 
 async def ensure_user(message: Message | CallbackQuery):
@@ -97,16 +161,21 @@ async def ensure_user(message: Message | CallbackQuery):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Хендлеры
+# ---------------------------------------------------------------------------
+
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     if not await ensure_user(message):
         return
     await state.clear()
-    await message.answer(
-        "💰 <b>Reward Tracker</b>\n\n"
-        "Учет вознаграждения представителя: основная встреча → дополнительные оферы → сумма.\n\n"
-        "Отчеты можно смотреть за сегодня и за месяц.",
-        reply_markup=main_menu(),
+    await _reply_and_track(
+        message,
+        "🅰️ <b>Reward Tracker</b> — version 3.0.4." \
+        "\n\nДобавляй встречи, фиксируй оферы и смотри статистику по дням и месяцам." \
+        " \n\nВыбери действие:",
+        main_menu(),
     )
 
 
@@ -132,14 +201,17 @@ async def choose_meeting_category(call: CallbackQuery, state: FSMContext):
     if category == "install":
         await state.update_data(product_code="installation", report_type="Установка", base_reward=340)
         await state.set_state(AddMeeting.waiting_id)
-        await call.message.edit_text(
-            "🛠 <b>Установка</b>\n\n"
-            "База: <b>340 ₽</b>\n\n"
-            "Теперь введи ID встречи."
+        await _edit(
+            call,
+            "🛠 <b>Установка</b>\n\nБаза: <b>340 ₽</b>\n\nТеперь введи ID встречи.",
         )
     else:
         title = "🇷🇺 <b>РФ</b>" if category == "rf" else "🌍 <b>Нерезидент</b>"
-        await call.message.edit_text(title + "\n\nВыбери основной продукт встречи:", reply_markup=meeting_products(category))
+        await _edit(
+            call,
+            title + "\n\nВыбери основной продукт встречи:",
+            meeting_products(category),
+        )
 
 
 @dp.callback_query(F.data.startswith("mprod:"))
@@ -155,10 +227,11 @@ async def choose_main_product(call: CallbackQuery, state: FSMContext):
     _, report_type, base = product
     await state.update_data(category=category, product_code=product_code, report_type=report_type, base_reward=base)
     await state.set_state(AddMeeting.waiting_id)
-    await call.message.edit_text(
+    await _edit(
+        call,
         f"✅ <b>{report_type}</b>\n"
         f"База за встречу: <b>{base} ₽</b>\n\n"
-        "🆔 Введи ID встречи одним сообщением."
+        "🆔 Введи ID встречи одним сообщением.",
     )
 
 
@@ -168,7 +241,8 @@ async def enter_meeting_id(message: Message, state: FSMContext):
         return
     meeting_code = (message.text or "").strip()
     if not meeting_code or len(meeting_code) > 100:
-        await message.answer("ID должен быть непустым и не длиннее 100 символов.")
+        err = await message.answer("ID должен быть непустым и не длиннее 100 символов.")
+        _track_extra(message.chat.id, err.message_id)
         return
 
     data = await state.get_data()
@@ -184,15 +258,20 @@ async def enter_meeting_id(message: Message, state: FSMContext):
 
     if data["category"] == "install":
         await state.clear()
-        await message.answer("✅ <b>Установка зафиксирована.</b>\n\n" + today_text(message.from_user.id), reply_markup=main_menu())
+        await _reply_and_track(
+            message,
+            "✅ <b>Установка зафиксирована.</b>\n\n" + today_text(message.from_user.id),
+            main_menu(),
+        )
     else:
         await state.set_state(AddMeeting.waiting_offers)
-        await message.answer(
+        await _reply_and_track(
+            message,
             f"✅ Встреча сохранена: <code>{meeting_code}</code>\n"
             f"Тип: <b>{data['report_type']}</b>\n"
             f"База: <b>{data['base_reward']} ₽</b>\n\n"
             "Теперь добавляй дополнительные оферы. Можно добавить несколько.",
-            reply_markup=offer_groups(),
+            offer_groups(),
         )
 
 
@@ -207,7 +286,7 @@ async def choose_offer_group(call: CallbackQuery, state: FSMContext):
         return
     group = OFFER_GROUPS[idx]
     await state.update_data(current_group_index=idx)
-    await call.message.edit_text(f"📦 <b>{group}</b>\n\nВыбери офер:", reply_markup=offers_keyboard(idx, OFFERS_BY_GROUP[group]))
+    await _edit(call, f"📦 <b>{group}</b>\n\nВыбери офер:", offers_keyboard(idx, OFFERS_BY_GROUP[group]))
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data == "offers:backgroups")
@@ -215,7 +294,7 @@ async def back_offer_groups(call: CallbackQuery, state: FSMContext):
     await safe_answer(call)
     if not await ensure_user(call):
         return
-    await call.message.edit_text("📦 <b>Дополнительные оферы</b>\n\nВыбери группу:", reply_markup=offer_groups())
+    await _edit(call, "📦 <b>Дополнительные оферы</b>\n\nВыбери группу:", offer_groups())
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("offer:"))
@@ -252,16 +331,16 @@ async def add_selected_offer(call: CallbackQuery, state: FSMContext):
     extra = ""
     if offer.deferred:
         extra = "\nВ отчёте за сегодня есть, в стату месяца попадёт 1-го числа следующего месяца."
-    await call.message.edit_text(
+    await _edit(
+        call,
         f"✅ <b>Добавлено</b>\n{offer.name}\n{offer.condition}\n+ <b>{offer.reward} ₽</b>{extra}\n\n"
         f"Оферов: <b>{count}</b> · Добавить ещё?",
-        reply_markup=offer_groups(),
+        offer_groups(),
     )
 
 
 @dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("oquick:"))
 async def add_quick_offer(call: CallbackQuery, state: FSMContext):
-    """Смарт и Доп. тревел — фиксированные оферы, добавляются одним нажатием."""
     if not await ensure_user(call):
         return
     code = call.data.split(":", 1)[1]
@@ -286,10 +365,11 @@ async def add_quick_offer(call: CallbackQuery, state: FSMContext):
     count = int(data.get("offer_count", 0)) + 1
     await state.update_data(offer_count=count)
     extra = "\nВ отчёте за сегодня есть, в стату месяца попадёт 1-го числа следующего месяца." if offer.deferred else ""
-    await call.message.edit_text(
+    await _edit(
+        call,
         f"✅ <b>Добавлено</b>\n{offer.name}\n+ <b>{offer.reward} ₽</b>{extra}\n\n"
         f"Оферов: <b>{count}</b> · Добавить ещё?",
-        reply_markup=offer_groups(),
+        offer_groups(),
     )
 
 
@@ -307,9 +387,10 @@ async def undo_offer(call: CallbackQuery, state: FSMContext):
     await state.update_data(offer_count=count)
     deleted_name = deleted.get("name", "Офер")
     deleted_reward = int(deleted.get("reward", 0))
-    await call.message.edit_text(
+    await _edit(
+        call,
         f"↩️ Удалён: <b>{deleted_name}</b> · {deleted_reward} ₽\n\nВыбери следующий:",
-        reply_markup=offer_groups(),
+        offer_groups(),
     )
 
 
@@ -368,6 +449,7 @@ async def select_month(call: CallbackQuery):
         return
 
     await safe_answer(call)
+    chat_id = call.message.chat.id
 
     try:
         chart = await month_chart_quickchart(call.from_user.id, year, month)
@@ -381,19 +463,29 @@ async def select_month(call: CallbackQuery):
         )
         return
 
-    # 1) Фото с короткой подписью, БЕЗ кнопок
-    await show_photo(
-        call,
-        chart,
-        month_summary_text(call.from_user.id, year, month),
+    # Чистим всё старое (включая текущее сообщение с кнопкой)
+    await _forget_and_delete(chat_id, skip=call.message.message_id)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    # 1) Фото с короткой подписью, без кнопок
+    photo_msg = await bot.send_photo(
+        chat_id,
+        BufferedInputFile(chart.getvalue(), filename=chart.name),
+        caption=month_summary_text(call.from_user.id, year, month),
     )
     chart.close()
 
     # 2) Одно компактное сообщение с деталями и кнопками
-    await call.message.answer(
+    details_msg = await bot.send_message(
+        chat_id,
         month_details_text(call.from_user.id, year, month),
         reply_markup=month_selector_keyboard(year, month),
     )
+    _track(chat_id, photo_msg.message_id, details_msg.message_id)
+
 
 @dp.callback_query(F.data == "menu:report")
 async def menu_report(call: CallbackQuery):
