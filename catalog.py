@@ -207,3 +207,35 @@ OFFER_ALIASES: dict[str, str] = {
     "сим": "mvno_active",
     "симка": "mvno_active",
 }
+
+# Алиасы для парсинга «дк рф смарт защитник» из свободного текста.
+# Ключ — то, что пользователь пишет; значение — код продукта в MEETING_PRODUCTS.
+PRODUCT_ALIASES: dict[str, str] = {
+    # РФ
+    "х5 рф": "x5_rf",
+    "x5 рф": "x5_rf",
+    "апельсин рф": "x5_rf",
+    "дк рф": "dc_rf",
+    "кк рф": "cc_rf",
+    "ре рф": "re_rf",
+    "перевыпуск ре": "re_rf",
+
+    # Нерезидент
+    "х5 нерез": "x5_nonresident",
+    "х5 нерезидент": "x5_nonresident",
+    "x5 нерез": "x5_nonresident",
+    "x5 нерезидент": "x5_nonresident",
+    "апельсин нерез": "x5_nonresident",
+    "дк нерез": "dc_nonresident",
+    "дк нерезидент": "dc_nonresident",
+    "кк нерез": "cc_nonresident",
+    "кк нерезидент": "cc_nonresident",
+
+    # Установка
+    "установка": "installation",
+    "установка ам": "installation",
+    "установка аи": "installation",
+}
+
+# Полный плоский список оферов: сначала быстрые, потом все остальные.
+ALL_OFFERS: tuple[Offer, ...] = tuple(QUICK_OFFERS) + tuple(ADDITIONAL_OFFERS)

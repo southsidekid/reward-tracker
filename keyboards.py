@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from catalog import ALFA_SMART, KIDS_CROSS, MEETING_PRODUCTS, OFFER_GROUPS, TRAVEL_FIXED
+from catalog import ALFA_SMART, ADDITIONAL_OFFERS, KIDS_CROSS, MEETING_PRODUCTS, TRAVEL_FIXED
 
 RU_MONTHS = (
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -20,7 +20,7 @@ def _short_product_name(name: str) -> str:
 def main_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="➕ Добавить встречу", callback_data="menu:add")
-    b.button(text="🔁 Как вчера", callback_data="menu:dup")
+    b.button(text="🔁 Повтор предыдущей", callback_data="menu:dup")
     b.button(text="📊 Отчёты", callback_data="menu:reports")
     b.button(text="⚙️ Настройки", callback_data="menu:settings")
     b.adjust(2, 2)
@@ -82,44 +82,6 @@ def meeting_products(category: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def offer_groups() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    icons = {
-        "Страховка": "🛡",
-        "Инвестиции": "📈",
-        "Накопительный": "💰",
-        "Комбо": "💳",
-        "Доп. детская": "👶",
-        "Доп. симка": "📶",
-    }
-    group_labels = {
-        "Страховка": "Страховки",
-        "Инвестиции": "Инвестиции",
-        "Накопительный": "Накопления",
-        "Комбо": "Комбо",
-        "Доп. детская": "Детская",
-        "Доп. симка": "SIM",
-    }
-    b.button(text=f"📱 {ALFA_SMART.name}  +{ALFA_SMART.reward} ₽", callback_data=f"oquick:{ALFA_SMART.code}")
-    b.button(text=f"✈️ Тревел +{TRAVEL_FIXED.reward}", callback_data=f"oquick:{TRAVEL_FIXED.code}")
-    b.button(text=f"👶 Детская +{KIDS_CROSS.reward}", callback_data=f"oquick:{KIDS_CROSS.code}")
-    for i, group in enumerate(OFFER_GROUPS):
-        b.button(text=f"{icons.get(group, '•')} {group_labels.get(group, group)}", callback_data=f"ogroup:{i}")
-    b.button(text="✅ Готово", callback_data="offers:done")
-    b.button(text="↩️ Удалить последний", callback_data="offers:undo")
-    b.button(text="❌ Отменить встречу", callback_data="meeting:cancel")
-    b.button(text="🏠 Меню", callback_data="nav:main")
-
-    n_groups = len(OFFER_GROUPS)
-    pattern = [3]
-    pattern += [2] * (n_groups // 2)
-    if n_groups % 2:
-        pattern.append(1)
-    pattern += [1, 1, 1, 1]
-    b.adjust(*pattern)
-    return b.as_markup()
-
-
 _SHORT_OFFER_LABELS = {
     "pp_cc": "PPI/CC · T+30",
     "ks_4_10k": "КС · 4–10 тыс.",
@@ -153,15 +115,31 @@ def _short_offer_button(offer) -> str:
     return f"{label} · {offer.reward} ₽"
 
 
-def offers_keyboard(group_index: int, options) -> InlineKeyboardMarkup:
+def offers_flat_keyboard() -> InlineKeyboardMarkup:
+    """Единый плоский список оферов: быстрые в ряд, остальные в 2 колонки."""
     b = InlineKeyboardBuilder()
-    for i, offer in enumerate(options):
-        b.button(text=_short_offer_button(offer), callback_data=f"offer:{group_index}:{i}")
-    b.button(text="⬅️ К группам", callback_data="offers:backgroups")
+
+    # Быстрые (3 в один ряд)
+    b.button(text=f"📱 Смарт +{ALFA_SMART.reward}", callback_data=f"add:{ALFA_SMART.code}")
+    b.button(text=f"✈️ Тревел +{TRAVEL_FIXED.reward}", callback_data=f"add:{TRAVEL_FIXED.code}")
+    b.button(text=f"👶 Детская +{KIDS_CROSS.reward}", callback_data=f"add:{KIDS_CROSS.code}")
+
+    # Остальные — плоским списком
+    for offer in ADDITIONAL_OFFERS:
+        b.button(text=_short_offer_button(offer), callback_data=f"add:{offer.code}")
+
+    # Действия
     b.button(text="✅ Готово", callback_data="offers:done")
     b.button(text="↩️ Удалить последний", callback_data="offers:undo")
     b.button(text="🏠 Меню", callback_data="nav:main")
-    b.adjust(1)
+
+    n = len(ADDITIONAL_OFFERS)
+    pattern = [3]
+    pattern += [2] * (n // 2)
+    if n % 2:
+        pattern.append(1)
+    pattern += [1, 1, 1]
+    b.adjust(*pattern)
     return b.as_markup()
 
 

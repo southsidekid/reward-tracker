@@ -3,22 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from catalog import (
     MEETING_PRODUCTS,
     OFFER_ALIASES,
-    OFFER_GROUPS,
     OFFERS_BY_CODE,
-    OFFERS_BY_GROUP,
+    PRODUCT_ALIASES,
     QUICK_OFFERS,
     next_month_first,
     payout_date_for,
@@ -41,8 +40,7 @@ from keyboards import (
     meeting_categories,
     meeting_products,
     month_selector_keyboard,
-    offer_groups,
-    offers_keyboard,
+    offers_flat_keyboard,
     report_result_menu,
     reports_menu,
     settings_menu,
@@ -65,12 +63,22 @@ cfg = load_config()
 bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-QUICK_OFFERS_BY_CODE = {o.code: o for o in QUICK_OFFERS}
-
 # Трекер активных сообщений бота в каждом чате (для чистки флуда)
 _last_bot_msgs: dict[int, list[int]] = {}
 
-HELLO = "💰 <b>Reward Tracker</b> — учёт вознаграждения по встречам и оферам."
+HELLO = (
+    "💰 <b>Reward Tracker</b>\n\n"
+    "Напиши встречу в чат одной строкой:\n"
+    "<i>дк рф смарт защитник</i>\n"
+    "<i>х5 нерез тревел детская</i>\n"
+    "<i>апельсин рф смарт</i>"
+)
+
+# --- Собираем все варианты PRODUCT_ALIASES (со пробелами и без) ----------
+_ALL_PRODUCT_ALIASES: dict[str, str] = {}
+for _k, _v in PRODUCT_ALIASES.items():
+    _ALL_PRODUCT_ALIASES[_k] = _v
+    _ALL_PRODUCT_ALIASES[_k.replace(" ", "")] = _v
 
 
 def allowed(uid: int) -> bool:
@@ -118,21 +126,6 @@ async def show_text(call: CallbackQuery, text: str, markup=None) -> None:
     _track(chat_id, msg.message_id)
 
 
-async def show_photo(call: CallbackQuery, image, caption: str, markup=None) -> None:
-    chat_id = call.message.chat.id
-    await _forget_and_delete(chat_id, skip=call.message.message_id)
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    msg = await call.message.answer_photo(
-        BufferedInputFile(image.getvalue(), filename=image.name),
-        caption=caption,
-        reply_markup=markup,
-    )
-    _track(chat_id, msg.message_id)
-
-
 async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
     chat_id = call.message.chat.id
     await _forget_and_delete(chat_id, skip=call.message.message_id)
@@ -169,6 +162,73 @@ async def ensure_user(message: Message | CallbackQuery):
         return False
     upsert_user(u.id, u.username, u.first_name)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Парсер свободного ввода: «дк рф смарт защитник»
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _match_product(normalized: str) -> tuple[str | None, str]:
+    """Возвращает (product_code, rest) или (None, исходная строка)."""
+    for alias in sorted(_ALL_PRODUCT_ALIASES.keys(), key=len, reverse=True):
+        if normalized == alias:
+            return _ALL_PRODUCT_ALIASES[alias], ""
+        if normalized.startswith(alias):
+            nxt = normalized[len(alias)]
+            if nxt in " ,;":
+                return _ALL_PRODUCT_ALIASES[alias], normalized[len(alias):].strip(" ,;")
+    return None, normalized
+
+
+def parse_free_entry(text: str) -> dict:
+    """Парсит «дк рф смарт защитник» → product + offers."""
+    normalized = _normalize(text)
+    product_code, rest = _match_product(normalized)
+    if not product_code:
+        return {"error": "no_product"}
+
+    category = report_type = None
+    base_reward = 0
+    for cat, products in MEETING_PRODUCTS.items():
+        for code, rtype, base in products:
+            if code == product_code:
+                category, report_type, base_reward = cat, rtype, base
+                break
+        if category:
+            break
+    if not category:
+        return {"error": "no_product"}
+
+    tokens = [t for t in re.split(r"[,\s;]+", rest) if t]
+    offers = []
+    unknown = []
+    for tok in tokens:
+        code = OFFER_ALIASES.get(tok)
+        offer = OFFERS_BY_CODE.get(code) if code else None
+        if offer is None:
+            unknown.append(tok)
+        else:
+            offers.append(offer)
+
+    return {
+        "product_code": product_code,
+        "category": category,
+        "report_type": report_type,
+        "base_reward": base_reward,
+        "offers": offers,
+        "unknown": unknown,
+    }
+
+
+def _auto_meeting_code() -> str:
+    return f"АВТО-{datetime.now().strftime('%d%m-%H%M%S')}"
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +408,7 @@ async def undo_no(call: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Добавление встречи (обычное)
+# Кнопочный флоу добавления встречи
 # ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data == "menu:add")
@@ -449,14 +509,13 @@ async def enter_meeting_id(message: Message, state: FSMContext):
             f"✅ Встреча сохранена: <code>{meeting_code}</code>\n"
             f"Тип: <b>{data['report_type']}</b>\n"
             f"База: <b>{data['base_reward']} ₽</b>\n\n"
-            "Теперь добавляй оферы кнопками или напиши списком:\n"
-            "<i>например: смарт, тревел, pp</i>",
-            offer_groups(),
+            "Жми оферы или напиши списком: <i>смарт, защитник, тревел</i>",
+            offers_flat_keyboard(),
         )
 
 
 # ---------------------------------------------------------------------------
-# «Как вчера» — дублирование последней встречи, новый ID вводится вручную
+# «Повтор предыдущей» — дублирование последней встречи, новый ID вводится вручную
 # ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data == "menu:dup")
@@ -468,7 +527,7 @@ async def menu_dup(call: CallbackQuery, state: FSMContext):
 
     last = get_last_meeting_with_offers(call.from_user.id)
     if not last:
-        await show_text(call, "🔁 Дублировать нечего — прошлых встреч нет.", main_menu())
+        await show_text(call, "🔁 Повторять нечего — прошлых встреч нет.", main_menu())
         return
 
     await state.update_data(
@@ -491,7 +550,7 @@ async def menu_dup(call: CallbackQuery, state: FSMContext):
     offers_text = "\n".join(f"• {o['name']} · {int(o['reward'])} ₽" for o in last["offers"]) or "• (без доп. оферов)"
     await show_text(
         call,
-        f"🔁 <b>Как вчера</b>\n\n"
+        f"🔁 <b>Повтор предыдущей</b>\n\n"
         f"Прошлый тип: <b>{last['report_type']}</b>\n"
         f"База: <b>{int(last['base_reward'])} ₽</b>\n"
         f"Оферы:\n{offers_text}\n\n"
@@ -532,7 +591,6 @@ async def enter_dup_id(message: Message, state: FSMContext):
         if cat_offer is not None:
             payout = payout_date_for(cat_offer, today_iso)
         elif old.get("payout_date"):
-            # офер не в каталоге, но был отложенным — оставляем логику переноса
             payout = next_month_first(today_iso)
         else:
             payout = None
@@ -541,7 +599,7 @@ async def enter_dup_id(message: Message, state: FSMContext):
     await state.clear()
     await _reply_and_track(
         message,
-        f"✅ <b>Создано как вчера</b>\n"
+        f"✅ <b>Повтор создан</b>\n"
         f"ID: <code>{meeting_code}</code>\n"
         f"Тип: <b>{data['dup_report_type']}</b>\n\n"
         + today_text(message.from_user.id),
@@ -550,82 +608,22 @@ async def enter_dup_id(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Работа с оферами встречи (кнопками + текстом)
+# Добавление оферов в waiting_offers (кнопки + текст)
 # ---------------------------------------------------------------------------
 
-@dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("ogroup:"))
-async def choose_offer_group(call: CallbackQuery, state: FSMContext):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    idx = int(call.data.split(":")[1])
-    if idx < 0 or idx >= len(OFFER_GROUPS):
-        await safe_answer(call, "Ошибка группы", show_alert=True)
-        return
-    group = OFFER_GROUPS[idx]
-    await state.update_data(current_group_index=idx)
-    await _edit(call, f"📦 <b>{group}</b>\n\nВыбери офер:", offers_keyboard(idx, OFFERS_BY_GROUP[group]))
-
-
-@dp.callback_query(AddMeeting.waiting_offers, F.data == "offers:backgroups")
-async def back_offer_groups(call: CallbackQuery, state: FSMContext):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await _edit(call, "📦 <b>Дополнительные оферы</b>\n\nВыбери группу или напиши список:", offer_groups())
-
-
-@dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("offer:"))
-async def add_selected_offer(call: CallbackQuery, state: FSMContext):
-    if not await ensure_user(call):
-        return
-    _, idx_s, opt_s = call.data.split(":")
-    idx, opt = int(idx_s), int(opt_s)
-    if idx < 0 or idx >= len(OFFER_GROUPS):
-        await safe_answer(call, "Ошибка", show_alert=True)
-        return
-    group = OFFER_GROUPS[idx]
-    options = OFFERS_BY_GROUP.get(group, ())
-    if opt < 0 or opt >= len(options):
-        await safe_answer(call, "Ошибка", show_alert=True)
-        return
-    offer = options[opt]
-    data = await state.get_data()
-    mid = int(data["meeting_id"])
-    if offer_exists(mid, offer.code):
-        await safe_answer(call, "Этот офер уже добавлен в эту встречу", show_alert=True)
-        return
-    await safe_answer(call)
-    add_offer(
-        mid, offer.code, offer.name, offer.condition, offer.reward,
-        payout_date_for(offer, today_local().isoformat()),
-    )
-    count = int(data.get("offer_count", 0)) + 1
-    await state.update_data(offer_count=count)
-    extra = ""
-    if offer.deferred:
-        extra = "\nВ отчёте за сегодня есть, в стату месяца попадёт 1-го числа следующего месяца."
-    await _edit(
-        call,
-        f"✅ <b>Добавлено</b>\n{offer.name}\n{offer.condition}\n+ <b>{offer.reward} ₽</b>{extra}\n\n"
-        f"Оферов: <b>{count}</b> · Добавить ещё?",
-        offer_groups(),
-    )
-
-
-@dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("oquick:"))
-async def add_quick_offer(call: CallbackQuery, state: FSMContext):
+@dp.callback_query(AddMeeting.waiting_offers, F.data.startswith("add:"))
+async def cb_add_offer(call: CallbackQuery, state: FSMContext):
     if not await ensure_user(call):
         return
     code = call.data.split(":", 1)[1]
-    offer = QUICK_OFFERS_BY_CODE.get(code)
+    offer = OFFERS_BY_CODE.get(code)
     if offer is None:
         await safe_answer(call, "Ошибка", show_alert=True)
         return
     data = await state.get_data()
     mid = int(data["meeting_id"])
     if offer_exists(mid, offer.code):
-        await safe_answer(call, "Этот офер уже добавлен в эту встречу", show_alert=True)
+        await safe_answer(call, "Этот офер уже добавлен", show_alert=True)
         return
     await safe_answer(call)
     add_offer(
@@ -634,12 +632,12 @@ async def add_quick_offer(call: CallbackQuery, state: FSMContext):
     )
     count = int(data.get("offer_count", 0)) + 1
     await state.update_data(offer_count=count)
-    extra = "\nВ отчёте за сегодня есть, в стату месяца попадёт 1-го числа следующего месяца." if offer.deferred else ""
+    extra = "\nВ отчёте за сегодня есть, в стату месяца попадёт 1-го числа след. месяца." if offer.deferred else ""
     await _edit(
         call,
         f"✅ <b>Добавлено</b>\n{offer.name}\n+ <b>{offer.reward} ₽</b>{extra}\n\n"
-        f"Оферов: <b>{count}</b> · Добавить ещё?",
-        offer_groups(),
+        f"Оферов: <b>{count}</b> · Добавляй ещё или жми «Готово»",
+        offers_flat_keyboard(),
     )
 
 
@@ -655,12 +653,11 @@ async def undo_offer(call: CallbackQuery, state: FSMContext):
     await safe_answer(call)
     count = max(0, int(data.get("offer_count", 0)) - 1)
     await state.update_data(offer_count=count)
-    deleted_name = deleted.get("name", "Офер")
-    deleted_reward = int(deleted.get("reward", 0))
     await _edit(
         call,
-        f"↩️ Удалён: <b>{deleted_name}</b> · {deleted_reward} ₽\n\nВыбери следующий:",
-        offer_groups(),
+        f"↩️ Удалён: <b>{deleted.get('name', 'Офер')}</b> · {int(deleted.get('reward', 0))} ₽\n\n"
+        f"Оферов: <b>{count}</b>",
+        offers_flat_keyboard(),
     )
 
 
@@ -673,23 +670,9 @@ async def finish_meeting(call: CallbackQuery, state: FSMContext):
     await show_text(call, "✅ <b>Встреча зафиксирована.</b>\n\n" + today_text(call.from_user.id), main_menu())
 
 
-@dp.callback_query(AddMeeting.waiting_offers, F.data == "meeting:cancel")
-async def cancel_meeting(call: CallbackQuery, state: FSMContext):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await state.clear()
-    deleted = delete_last_meeting(call.from_user.id)
-    text = "🗑 Черновик встречи удалён." if deleted else "Действие отменено."
-    await show_text(call, text, main_menu())
-
-
-# ---------------------------------------------------------------------------
-# Быстрый ввод оферов текстом: «смарт, тревел, pp»
-# ---------------------------------------------------------------------------
-
 @dp.message(AddMeeting.waiting_offers)
-async def parse_offers_text(message: Message, state: FSMContext):
+async def text_offers_in_meeting(message: Message, state: FSMContext):
+    """Пользователь дописывает оферы текстом, пока встреча в процессе."""
     if not await ensure_user(message):
         return
     raw = (message.text or "").strip()
@@ -703,18 +686,11 @@ async def parse_offers_text(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    tokens = [t.strip().lower() for t in re.split(r"[,\n;]+", raw) if t.strip()]
-
-    added: list[str] = []
-    skipped: list[str] = []
-    unknown: list[str] = []
-
+    tokens = [t for t in re.split(r"[,\s;]+", _normalize(raw)) if t]
+    added, skipped, unknown = [], [], []
     for tok in tokens:
         code = OFFER_ALIASES.get(tok)
-        if not code:
-            unknown.append(tok)
-            continue
-        offer = OFFERS_BY_CODE.get(code)
+        offer = OFFERS_BY_CODE.get(code) if code else None
         if offer is None:
             unknown.append(tok)
             continue
@@ -743,16 +719,11 @@ async def parse_offers_text(message: Message, state: FSMContext):
         lines.append("")
         lines.append("❓ Не распознал:")
         lines.extend(f"• {x}" for x in unknown)
-        lines.append("")
-        lines.append("<i>Сложные тарифы (КС, БС разных сумм) — через кнопки.</i>")
-    if not added and not skipped and not unknown:
-        lines.append("")
-        lines.append("Ничего не понял, попробуй ещё раз.")
-
+        lines.append("<i>Сложные тарифы — через кнопки.</i>")
     lines.append("")
-    lines.append(f"Всего оферов у встречи: <b>{count}</b>")
+    lines.append(f"Всего оферов: <b>{count}</b>")
 
-    await _reply_and_track(message, "\n".join(lines), offer_groups())
+    await _reply_and_track(message, "\n".join(lines), offers_flat_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +738,81 @@ async def cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await show_text(call, "Действие отменено.", main_menu())
 
+
+# ---------------------------------------------------------------------------
+# Свободный ввод вне FSM: «дк рф смарт защитник» → создаём встречу сразу
+# ---------------------------------------------------------------------------
+
+@dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def free_entry(message: Message, state: FSMContext):
+    if not await ensure_user(message):
+        return
+    parsed = parse_free_entry(message.text or "")
+    if parsed.get("error") == "no_product":
+        # Не похоже на встречу — просто подскажем формат
+        await _reply_and_track(
+            message,
+            "❌ Не понял тип встречи.\n\n"
+            "Примеры:\n"
+            "<i>дк рф смарт защитник</i>\n"
+            "<i>х5 нерез тревел детская</i>\n"
+            "<i>апельсин рф смарт</i>",
+            main_menu(),
+        )
+        return
+
+    today_iso = today_local().isoformat()
+    code = _auto_meeting_code()
+    mid = create_meeting(
+        message.from_user.id,
+        code,
+        parsed["category"],
+        parsed["report_type"],
+        today_iso,
+        int(parsed["base_reward"]),
+    )
+
+    added_lines = []
+    skipped_lines = []
+    for offer in parsed["offers"]:
+        if offer_exists(mid, offer.code):
+            skipped_lines.append(f"• {offer.name}")
+            continue
+        add_offer(
+            mid, offer.code, offer.name, offer.condition, offer.reward,
+            payout_date_for(offer, today_iso),
+        )
+        added_lines.append(f"• {offer.name} · +{offer.reward} ₽")
+
+    total = int(parsed["base_reward"]) + sum(
+        int(o.reward) for o in parsed["offers"] if not offer_exists(mid, o.code) or True
+    )
+    # Правильнее пересчитать из БД:
+    from db import get_meeting_offers as _gmo
+    total = int(parsed["base_reward"]) + sum(int(o["reward"]) for o in _gmo(mid))
+
+    lines = [
+        f"✅ <b>{parsed['report_type']}</b> · <code>{code}</code>",
+        f"База: <b>{parsed['base_reward']} ₽</b>",
+    ]
+    if added_lines:
+        lines.append("")
+        lines.append("Оферы:")
+        lines.extend(added_lines)
+    if skipped_lines:
+        lines.append("")
+        lines.append("⚠️ Уже были (пропущено):")
+        lines.extend(skipped_lines)
+    if parsed["unknown"]:
+        lines.append("")
+        lines.append("❓ Не распознал: <i>" + ", ".join(parsed["unknown"]) + "</i>")
+    lines.append("")
+    lines.append(f"<b>Итого: {total} ₽</b>")
+
+    await _reply_and_track(message, "\n".join(lines), main_menu())
+
+
+# ---------------------------------------------------------------------------
 
 async def main():
     init_db()
