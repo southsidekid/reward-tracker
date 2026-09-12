@@ -29,6 +29,7 @@ from db import (
     delete_last_meeting,
     delete_last_offer,
     get_last_meeting_with_offers,
+    get_meeting_offers,
     init_db,
     offer_exists,
     upsert_user,
@@ -41,9 +42,6 @@ from keyboards import (
     meeting_products,
     month_selector_keyboard,
     offers_flat_keyboard,
-    report_result_menu,
-    reports_menu,
-    settings_menu,
 )
 from reports import (
     daily_report,
@@ -66,11 +64,10 @@ dp = Dispatcher()
 # Трекер активных сообщений бота в каждом чате (для чистки флуда)
 _last_bot_msgs: dict[int, list[int]] = {}
 
-HELLO = (
-    "🅰️ <b>Reward Tracker </b>"
-)
+VERSION = "3.1.3"
+HELLO = f"🅰️ <b>Reward Tracker</b> — v{VERSION}"
 
-# --- Собираем все варианты PRODUCT_ALIASES (со пробелами и без) ----------
+# Собираем все варианты PRODUCT_ALIASES (со пробелами и без)
 _ALL_PRODUCT_ALIASES: dict[str, str] = {}
 for _k, _v in PRODUCT_ALIASES.items():
     _ALL_PRODUCT_ALIASES[_k] = _v
@@ -172,7 +169,6 @@ def _normalize(text: str) -> str:
 
 
 def _match_product(normalized: str) -> tuple[str | None, str]:
-    """Возвращает (product_code, rest) или (None, исходная строка)."""
     for alias in sorted(_ALL_PRODUCT_ALIASES.keys(), key=len, reverse=True):
         if normalized == alias:
             return _ALL_PRODUCT_ALIASES[alias], ""
@@ -184,7 +180,6 @@ def _match_product(normalized: str) -> tuple[str | None, str]:
 
 
 def parse_free_entry(text: str) -> dict:
-    """Парсит «дк рф смарт защитник» → product + offers."""
     normalized = _normalize(text)
     product_code, rest = _match_product(normalized)
     if not product_code:
@@ -252,63 +247,49 @@ async def nav_main(call: CallbackQuery, state: FSMContext):
     await show_text(call, text, main_menu())
 
 
-@dp.callback_query(F.data == "menu:reports")
-async def menu_reports(call: CallbackQuery, state: FSMContext):
+# ---------------------------------------------------------------------------
+# Отчёты — прямые кнопки главного меню, без сабменю
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "menu:today")
+async def menu_today(call: CallbackQuery, state: FSMContext):
     await safe_answer(call)
     if not await ensure_user(call):
         return
     await state.clear()
-    await show_text(call, "📊 <b>Отчёты</b>\n\nВыбери раздел:", reports_menu())
+    await show_text(call, today_text(call.from_user.id), main_menu())
 
 
-@dp.callback_query(F.data == "menu:settings")
-async def menu_settings(call: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "menu:month")
+async def menu_month(call: CallbackQuery, state: FSMContext):
     await safe_answer(call)
     if not await ensure_user(call):
         return
     await state.clear()
-    await show_text(call, "⚙️ <b>Настройки</b>", settings_menu())
-
-
-# ---------------------------------------------------------------------------
-# Отчёты
-# ---------------------------------------------------------------------------
-
-@dp.callback_query(F.data == "report:today")
-async def report_today(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, today_text(call.from_user.id), report_result_menu())
-
-
-@dp.callback_query(F.data == "report:daily")
-async def report_daily(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, daily_report(call.from_user.id), report_result_menu())
-
-
-@dp.callback_query(F.data == "report:history")
-async def report_history(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
-    await show_text(call, history_text(call.from_user.id), report_result_menu())
-
-
-@dp.callback_query(F.data == "report:month")
-async def report_month(call: CallbackQuery):
-    await safe_answer(call)
-    if not await ensure_user(call):
-        return
     today = date.today()
     await show_text(
         call,
         "📈 <b>Отчёт за месяц</b>\n\nВыбери месяц:",
         month_selector_keyboard(today.year, today.month),
     )
+
+
+@dp.callback_query(F.data == "menu:report")
+async def menu_report(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await state.clear()
+    await show_text(call, daily_report(call.from_user.id), main_menu())
+
+
+@dp.callback_query(F.data == "menu:history")
+async def menu_history(call: CallbackQuery, state: FSMContext):
+    await safe_answer(call)
+    if not await ensure_user(call):
+        return
+    await state.clear()
+    await show_text(call, history_text(call.from_user.id), main_menu())
 
 
 @dp.callback_query(F.data.startswith("month:"))
@@ -364,11 +345,12 @@ async def select_month(call: CallbackQuery):
 # Удаление последней встречи
 # ---------------------------------------------------------------------------
 
-@dp.callback_query(F.data == "settings:undo")
-async def settings_undo(call: CallbackQuery):
+@dp.callback_query(F.data == "menu:undo")
+async def menu_undo(call: CallbackQuery, state: FSMContext):
     await safe_answer(call)
     if not await ensure_user(call):
         return
+    await state.clear()
     await show_text(call, "⚠️ Удалить последнюю добавленную встречу?\nУдаление необратимо.", confirm_delete())
 
 
@@ -392,7 +374,7 @@ async def undo_yes(call: CallbackQuery):
         )
     else:
         text = "Нечего удалять."
-    await show_text(call, text, settings_menu())
+    await show_text(call, text, main_menu())
 
 
 @dp.callback_query(F.data == "undo:no")
@@ -400,7 +382,7 @@ async def undo_no(call: CallbackQuery):
     await safe_answer(call)
     if not await ensure_user(call):
         return
-    await show_text(call, "⚙️ <b>Настройки</b>", settings_menu())
+    await show_text(call, "Отменено.", main_menu())
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +493,7 @@ async def enter_meeting_id(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# «Повтор предыдущей» — дублирование последней встречи, новый ID вводится вручную
+# «Повтор предыдущей»
 # ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data == "menu:dup")
@@ -668,7 +650,6 @@ async def finish_meeting(call: CallbackQuery, state: FSMContext):
 
 @dp.message(AddMeeting.waiting_offers)
 async def text_offers_in_meeting(message: Message, state: FSMContext):
-    """Пользователь дописывает оферы текстом, пока встреча в процессе."""
     if not await ensure_user(message):
         return
     raw = (message.text or "").strip()
@@ -723,7 +704,7 @@ async def text_offers_in_meeting(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Отмена (совместимость)
+# Отмена
 # ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data == "cancel")
@@ -736,7 +717,7 @@ async def cancel(call: CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Свободный ввод вне FSM: «дк рф смарт защитник» → создаём встречу сразу
+# Свободный ввод: «дк рф смарт защитник» → создаём встречу сразу
 # ---------------------------------------------------------------------------
 
 @dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
@@ -745,7 +726,6 @@ async def free_entry(message: Message, state: FSMContext):
         return
     parsed = parse_free_entry(message.text or "")
     if parsed.get("error") == "no_product":
-        # Не похоже на встречу — просто подскажем формат
         await _reply_and_track(
             message,
             "❌ Не понял тип встречи.\n\n"
@@ -780,12 +760,7 @@ async def free_entry(message: Message, state: FSMContext):
         )
         added_lines.append(f"• {offer.name} · +{offer.reward} ₽")
 
-    total = int(parsed["base_reward"]) + sum(
-        int(o.reward) for o in parsed["offers"] if not offer_exists(mid, o.code) or True
-    )
-    # Правильнее пересчитать из БД:
-    from db import get_meeting_offers as _gmo
-    total = int(parsed["base_reward"]) + sum(int(o["reward"]) for o in _gmo(mid))
+    total = int(parsed["base_reward"]) + sum(int(o["reward"]) for o in get_meeting_offers(mid))
 
     lines = [
         f"✅ <b>{parsed['report_type']}</b> · <code>{code}</code>",
@@ -808,11 +783,9 @@ async def free_entry(message: Message, state: FSMContext):
     await _reply_and_track(message, "\n".join(lines), main_menu())
 
 
-# ---------------------------------------------------------------------------
-
 async def main():
     init_db()
-    log.info("Starting reward tracker bot")
+    log.info("Starting reward tracker bot v%s", VERSION)
     await dp.start_polling(bot)
 
 

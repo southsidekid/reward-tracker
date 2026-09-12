@@ -21,11 +21,13 @@ def main_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="➕ Добавить встречу", callback_data="menu:add")
     b.button(text="🔁 Повтор предыдущей", callback_data="menu:dup")
-    b.button(text="📊 Отчёты", callback_data="menu:reports")
-    b.button(text="⚙️ Настройки", callback_data="menu:settings")
-    b.adjust(2, 2)
+    b.button(text="📊 Сегодня", callback_data="menu:today")
+    b.button(text="📈 Месяц", callback_data="menu:month")
+    b.button(text="🧾 Отчёт за сегодня", callback_data="menu:report")
+    b.button(text="🕘 История", callback_data="menu:history")
+    b.button(text="↩️ Удалить последнюю", callback_data="menu:undo")
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
-
 
 def reports_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
