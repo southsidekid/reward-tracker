@@ -67,11 +67,7 @@ dp = Dispatcher()
 _last_bot_msgs: dict[int, list[int]] = {}
 
 HELLO = (
-    "💰 <b>Reward Tracker</b>\n\n"
-    "Напиши встречу в чат одной строкой:\n"
-    "<i>дк рф смарт защитник</i>\n"
-    "<i>х5 нерез тревел детская</i>\n"
-    "<i>апельсин рф смарт</i>"
+    "🅰️ <b>Reward Tracker </b>"
 )
 
 # --- Собираем все варианты PRODUCT_ALIASES (со пробелами и без) ----------
