@@ -134,7 +134,7 @@ def get_meeting_offers(meeting_id: int):
 
 
 def delete_last_meeting(telegram_id: int):
-    """Удаляет последнюю встречу и возвращает, что именно было удалено."""
+    """Удаляет последнюю встречу (любую, без привязки к дате)."""
     with conn() as c:
         row = c.execute(
             "SELECT * FROM meetings WHERE telegram_id = ? ORDER BY id DESC LIMIT 1", (telegram_id,)
@@ -151,7 +151,7 @@ def delete_last_meeting(telegram_id: int):
 
 
 def get_last_meeting_with_offers(telegram_id: int):
-    """Возвращает последнюю встречу вместе со списком оферов (без удаления)."""
+    """Последняя встреча пользователя (любая, без привязки к дате)."""
     with conn() as c:
         row = c.execute(
             "SELECT * FROM meetings WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
@@ -163,6 +163,43 @@ def get_last_meeting_with_offers(telegram_id: int):
         offers = [dict(r) for r in c.execute(
             "SELECT * FROM offers WHERE meeting_id = ? ORDER BY id", (int(row["id"]),)
         ).fetchall()]
+        meeting["offers"] = offers
+        return meeting
+
+
+def get_last_meeting_with_offers_for_date(telegram_id: int, day_iso: str):
+    """Последняя встреча пользователя ЗА КОНКРЕТНЫЙ ДЕНЬ, вместе с оферами."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT * FROM meetings WHERE telegram_id = ? AND meeting_date = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (telegram_id, day_iso),
+        ).fetchone()
+        if not row:
+            return None
+        meeting = dict(row)
+        offers = [dict(r) for r in c.execute(
+            "SELECT * FROM offers WHERE meeting_id = ? ORDER BY id", (int(row["id"]),)
+        ).fetchall()]
+        meeting["offers"] = offers
+        return meeting
+
+
+def delete_last_meeting_for_date(telegram_id: int, day_iso: str):
+    """Удаляет последнюю встречу пользователя ЗА КОНКРЕТНЫЙ ДЕНЬ."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT * FROM meetings WHERE telegram_id = ? AND meeting_date = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (telegram_id, day_iso),
+        ).fetchone()
+        if not row:
+            return None
+        meeting = dict(row)
+        offers = [dict(r) for r in c.execute(
+            "SELECT * FROM offers WHERE meeting_id = ? ORDER BY id", (int(row["id"]),)
+        ).fetchall()]
+        c.execute("DELETE FROM meetings WHERE id = ?", (int(row["id"]),))
         meeting["offers"] = offers
         return meeting
 
@@ -300,3 +337,59 @@ def offers_deferred_sold_in_month(telegram_id: int, year: int, month: int):
                ORDER BY o.id""",
             (telegram_id, prefix),
         ).fetchall()
+
+
+def meeting_days_with_counts(telegram_id: int) -> list[tuple[str, int]]:
+    """Список дат (ISO), в которых были встречи, + количество."""
+    with conn() as c:
+        rows = c.execute(
+            """SELECT meeting_date, COUNT(*) AS n
+               FROM meetings WHERE telegram_id = ?
+               GROUP BY meeting_date ORDER BY meeting_date DESC""",
+            (telegram_id,),
+        ).fetchall()
+    return [(str(r["meeting_date"]), int(r["n"])) for r in rows]
+
+
+def get_meeting_by_id(meeting_id: int, telegram_id: int):
+    with conn() as c:
+        return c.execute(
+            "SELECT * FROM meetings WHERE id = ? AND telegram_id = ?",
+            (meeting_id, telegram_id),
+        ).fetchone()
+
+
+def update_meeting_code(meeting_id: int, telegram_id: int, new_code: str) -> bool:
+    with conn() as c:
+        cur = c.execute(
+            "UPDATE meetings SET meeting_code = ? WHERE id = ? AND telegram_id = ?",
+            (new_code, meeting_id, telegram_id),
+        )
+        return cur.rowcount > 0
+
+
+def delete_offer_by_id(offer_id: int, telegram_id: int):
+    with conn() as c:
+        row = c.execute(
+            """SELECT o.*, m.id AS mid FROM offers o
+               JOIN meetings m ON m.id = o.meeting_id
+               WHERE o.id = ? AND m.telegram_id = ?""",
+            (offer_id, telegram_id),
+        ).fetchone()
+        if not row:
+            return None
+        c.execute("DELETE FROM offers WHERE id = ?", (offer_id,))
+        c.execute(
+            "UPDATE meetings SET total_reward = total_reward - ? WHERE id = ?",
+            (int(row["reward"]), int(row["mid"])),
+        )
+        return dict(row)
+
+
+def delete_meeting_by_id(meeting_id: int, telegram_id: int) -> bool:
+    with conn() as c:
+        cur = c.execute(
+            "DELETE FROM meetings WHERE id = ? AND telegram_id = ?",
+            (meeting_id, telegram_id),
+        )
+        return cur.rowcount > 0
