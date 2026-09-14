@@ -190,33 +190,64 @@ def history_text(telegram_id: int) -> str:
         )
     return "\n".join(lines)
 
-
 def day_meetings_text(telegram_id: int, day_iso: str) -> str:
     meetings = today_meetings(telegram_id, day_iso)
     if not meetings:
-        return f"🧾 На {day_iso} встреч нет."
+        return f"🧾 <b>{day_iso}</b>\n\nВстреч нет."
+
+    # Красивая дата: "Пн 14 сентября"
+    try:
+        d = date.fromisoformat(day_iso)
+        pretty = f"{RU_WEEKDAYS_SHORT[d.weekday()]} {d.day} {RU_MONTHS_GEN[d.month - 1]}"
+    except Exception:
+        pretty = day_iso
+
     total_with = 0
     total_without = 0
-    lines = [f"🧾 <b>{day_iso}</b>", f"Встреч: <b>{len(meetings)}</b>", ""]
+    type_count: Counter = Counter()
+    offer_count: Counter = Counter()
+    items: list[str] = []
+
     for i, m in enumerate(meetings, 1):
         offers = get_meeting_offers(int(m["id"]))
         deferred = sum(int(o["reward"]) for o in offers if o["payout_date"])
         total_with += int(m["total_reward"])
         total_without += int(m["total_reward"]) - deferred
+
+        type_count[str(m["report_type"])] += 1
+
         labels = []
         for o in offers:
             label = _offer_group_label(str(o["code"]), str(o["name"]))
+            offer_count[label] += 1
             if label not in labels:
                 labels.append(label)
-        offer_part = ", ".join(labels) if labels else "без доп. оферов"
-        lines.append(
-            f"{i}. <code>{m['meeting_code']}</code>, {m['report_type']}, "
+
+        offer_part = ", ".join(labels) if labels else "—"
+        items.append(
+            f"{i}. <code>{m['meeting_code']}</code> · {m['report_type']} · "
             f"{offer_part} — <b>{rub(int(m['total_reward']))}</b>"
         )
-    lines.append("")
-    lines.append(f"Чистыми: <b>{rub(total_without)}</b> · Со Смарт/страх: <b>{rub(total_with)}</b>")
-    return "\n".join(lines)
 
+    # --- Компактная сводка «тип: n» ---
+    summary: list[str] = []
+    for rt, cnt in type_count.items():
+        summary.append(f"{rt}: {cnt}")
+    for lbl, cnt in offer_count.items():
+        summary.append(f"{lbl}: {cnt}")
+
+    head = f"🧾 <b>{pretty}</b> · {_plural_meetings(len(meetings))}"
+    money = f"Чистыми: <b>{rub(total_without)}</b>"
+    if total_with != total_without:
+        money += f" · Со Смарт/страх: <b>{rub(total_with)}</b>"
+
+    parts = [head, money]
+    if summary:
+        parts.append("")
+        parts.extend(summary)
+    parts.append("")
+    parts.extend(items)
+    return "\n".join(parts)
 
 # ---------------------------------------------------------------------------
 # Главный экран (приветствие + погода + сводка + подсказка)
