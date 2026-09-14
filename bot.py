@@ -841,11 +841,7 @@ async def id_skip(call: CallbackQuery, state: FSMContext):
     # --- повтор предыдущей ---
     if "dup_category" in data and "category" not in data:
         await safe_answer(call, f"ID: {code}")
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
-        await _finalize_dup(call.message, state, code)
+        await _finalize_dup(call.message, call.from_user.id, state, code)
         return
 
     # --- новая встреча ---
@@ -1154,14 +1150,13 @@ async def enter_dup_id(message: Message, state: FSMContext):
         await message.delete()
     except Exception:
         pass
-    await _finalize_dup(message, state, meeting_code)
+    await _finalize_dup(message, message.from_user.id, state, meeting_code)
 
-
-async def _finalize_dup(message: Message, state: FSMContext, meeting_code: str) -> None:
+async def _finalize_dup(message: Message, user_id: int, state: FSMContext, meeting_code: str) -> None:
     data = await state.get_data()
     today_iso = today_local().isoformat()
     mid = create_meeting(
-        message.from_user.id,
+        user_id,
         meeting_code,
         data["dup_category"],
         data["dup_report_type"],
@@ -1185,10 +1180,9 @@ async def _finalize_dup(message: Message, state: FSMContext, meeting_code: str) 
         f"✅ <b>Повтор создан</b>\n"
         f"ID: <code>{meeting_code}</code>\n"
         f"Тип: <b>{data['dup_report_type']}</b>\n\n"
-        + today_text(message.from_user.id),
+        + today_text(user_id),
         main_menu(),
     )
-
 
 # ---------------------------------------------------------------------------
 # Отмена
